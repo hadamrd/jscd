@@ -3698,6 +3698,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             return r;
         }
         let base = name.split('.').next().unwrap_or(name);
+        let base = base.strip_suffix("Constant").unwrap_or(base);
         matches!(
             base,
             "Star" | "Star0" | "Star1" | "Star2" | "Star3" | "Star4" | "Star5" | "Star6" | "Star7"
@@ -6814,6 +6815,17 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                                         let else_start = self.out.len();
                                         else_text_start = else_start;
                                         // 不按 `end` 裁剪：短路共享目标可能正好在当前范围之外
+                                        // —— except when a catch handler starts in [end, e_idx):
+                                        // then we are in a try body and the join is past the
+                                        // handler (`try { if (c) break; else X } catch {..}` in a
+                                        // loop), so running on would emit the catch code twice
+                                        let crosses_handler = e_idx > end
+                                            && self.handlers.iter().any(|h| {
+                                                self.idx_of
+                                                    .get(&(h.target as usize))
+                                                    .is_some_and(|&t| t >= end && t < e_idx)
+                                            });
+                                        let e_idx = if crosses_handler { end } else { e_idx };
                                         self.emit_range(t_idx, e_idx)?;
                                         self.materialize_acc(&phi, &acc_then);
                                         else_assigned = self.out[else_start..].contains(&format!("{phi} = "));
@@ -7163,6 +7175,9 @@ impl<'a, 'b> FnCtx<'a, 'b> {
 
     /// 条件表达式（由跳转类型 + acc 推出）。返回 Expr 以便复用取反化简。
     fn cond_of(&self, base: &str) -> Expr {
+        // `JumpIf*Constant` (offset in the constant pool) tests the same thing; falling into
+        // `_ => acc` emitted every long `JumpIfFalse*` inverted (`while (!![])` → `if ([]) break;`)
+        let base = base.strip_suffix("Constant").unwrap_or(base);
         let acc = self.acc.clone().unwrap_or(Expr::Bool(true));
         let neg = |e: Expr| Expr::Un {
             op: "!",
