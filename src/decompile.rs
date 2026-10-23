@@ -2549,11 +2549,18 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         None
     }
 
+    /// Upper bound on the elements a literal-backing array can hold: its byte size in tagged
+    /// slots. Guards against garbage lengths without truncating real literals (a flat 64 cut
+    /// an obfuscator's 8669-entry string table to 64 entries).
+    fn elem_cap(&self, o: ObjId) -> usize {
+        self.d.cache.obj(o).byte_size / self.d.ts.max(1)
+    }
+
     /// FixedArray 常量值序列 → `[ … ]`（非全常量位在 6.x 里是 the_hole）。
     fn fixed_array_literal(&mut self, holder: ObjId) -> Expr {
         let n = self.d.cache.array_len(holder);
         let mut items = Vec::new();
-        for i in 0..n.min(64) {
+        for i in 0..n.min(self.elem_cap(holder)) {
             items.push(self.fixed_elem_expr(holder, i));
         }
         Expr::ArrayLit(items)
@@ -2599,7 +2606,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             }
         }
         let mut parts = Vec::new();
-        for i in 0..count.min(64) {
+        for i in 0..count.min(self.elem_cap(o)) {
             let key = self.elem_key(o, start + 2 * i);
             let val = self.fixed_elem_expr(o, start + 2 * i + 1);
             let k = match key {
@@ -2887,7 +2894,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
     /// 对象字面量的"键为字符串"打分（用于自动判定 kDescriptionStartIndex）。
     fn obp_string_keys(&self, o: ObjId, start: usize, len: usize) -> usize {
         let count = if start >= 2 { len / 2 } else { len.saturating_sub(start) / 2 };
-        (0..count.min(64))
+        (0..count.min(self.elem_cap(o)))
             .filter(|i| self.elem_key(o, start + 2 * i).is_some_and(|k| !k.starts_with('<') || k.starts_with("<ro")))
             .count()
     }
@@ -2940,7 +2947,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             len.saturating_sub(start) / 2
         };
         let mut parts = Vec::new();
-        for i in 0..count.min(64) {
+        for i in 0..count.min(self.elem_cap(o)) {
             let key = self.elem_key(o, start + 2 * i);
             let val = match self.d.cache.array_elem(o, start + 2 * i + 1) {
                 Some(Elem::Smi(v)) => Expr::Num(v as f64),
@@ -2984,7 +2991,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             }
         }
         let mut items = Vec::new();
-        for i in 0..len.min(64) {
+        for i in 0..len.min(self.elem_cap(holder)) {
             // 双精度数组的元素是原始 f64 —— 必须走 8 字节解码；否则 Smi 判定
             // （低 32 位为 0）会与低半为零的 double（1.5、-0、0.5…）撞车，
             // 把高半截成整数（`[1.5]` → `[1073217536]`）。
@@ -8371,18 +8378,18 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     let cooked_arr = self.template_part(o, 2);
                     if let (Some(r), Some(c)) = (raw_arr, cooked_arr) {
                         let n = self.d.cache.array_len(c);
-                        for k in 0..n.min(64) {
+                        for k in 0..n.min(self.elem_cap(c)) {
                             cooked.push(self.array_element_expr(c, k));
                         }
                         let n2 = self.d.cache.array_len(r);
-                        for k in 0..n2.min(64) {
+                        for k in 0..n2.min(self.elem_cap(r)) {
                             raw.push(self.array_element_expr(r, k));
                         }
                     } else {
                         // 退路：老版本/未知布局按一半一半读
                         let len = self.d.cache.array_len(o);
                         let half = len / 2;
-                        for k in 0..half.min(64) {
+                        for k in 0..half.min(self.elem_cap(o)) {
                             cooked.push(self.array_element_expr(o, k));
                             raw.push(self.array_element_expr(o, half + k));
                         }
