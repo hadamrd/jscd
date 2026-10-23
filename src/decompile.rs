@@ -1139,11 +1139,37 @@ impl<'a> Decompiler<'a> {
     /// `const nest = (x) => (y) => x * y` 的内外两层箭头都叫 `nest`；同名声明会互相
     /// 覆盖、引用（DeclareGlobals、闭包常量）全都指到最后一个。这里按对象顺序去重：
     /// 先到的用本名，后来的加 `_2`/`_3` 后缀（闭包里对它的引用同步用这个名字）。
+    /// `function_syntax_kind` from the SFI flags (0 = anonymous expression, 1 = named
+    /// expression, 2 = declaration, ...). Bits 7..9 per the 8.x `SharedFunctionInfoFlags`;
+    /// only trusted on 8.7, where it was checked against known declarations.
+    fn sfi_syntax_kind(&self, sfi: ObjId) -> Option<u32> {
+        if !self.table.v8.starts_with("8.7.") {
+            return None;
+        }
+        let off = self.table.shared_function_info.as_ref()?.fields.get("flags").copied()?;
+        let rt = self.cache.bca_rt_off(self.table, self.ts, sfi, off);
+        let b = self.cache.raw_at_ts(sfi, rt, 4, self.ts)?;
+        Some((u32::from_le_bytes(b.try_into().ok()?) >> 7) & 7)
+    }
+
     pub fn function_emit_name(&self, sfi: ObjId) -> String {
         let mut slot = self.emit_names.borrow_mut();
         if slot.is_none() {
             let mut map: HashMap<ObjId, String> = HashMap::new();
             let mut used: HashSet<String> = HashSet::new();
+            // Variables any scope declares. An anonymous function expression is named after
+            // the variable it is assigned to; emitting it under that same name turns the
+            // store into `x = x` (dropped as a no-op), and the hoisted `function x` is then
+            // shadowed by whatever else the variable holds. That broke the obfuscator's
+            // self-replacing string decoder: `a0_0x2d98 = function (..) {..}` vanished.
+            let mut bindings: HashSet<String> = HashSet::new();
+            for id in 0..self.cache.objects.len() {
+                if self.cache.obj(id).ty.is(self.table, "ScopeInfo") {
+                    if let Some(s) = read_scope(self.cache, self.table, self.ts, id, self.ro_map.as_deref()) {
+                        bindings.extend(s.context_locals.into_iter().filter(|n| !n.is_empty()));
+                    }
+                }
+            }
             for id in 0..self.cache.objects.len() {
                 if !self.cache.obj(id).ty.is(self.table, "SharedFunctionInfo") {
                     continue;
@@ -1151,6 +1177,8 @@ impl<'a> Decompiler<'a> {
                 let raw = self.dis.sfi_name(id);
                 let base = if raw.trim().is_empty() {
                     anon_name(id)
+                } else if bindings.contains(raw.trim()) && self.sfi_syntax_kind(id) == Some(0) {
+                    format!("{}_fn", sanitize_var(&raw))
                 } else {
                     sanitize_var(&raw)
                 };
