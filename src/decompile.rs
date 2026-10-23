@@ -5675,7 +5675,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         }
         // ── 发射 ──
         self.flush_acc_before("SwitchOnSmiNoFeedback");
-        // `<this>`/`<context>` are register spellings, not JS (`switch (<this>)` on a String.prototype method)
+        // `<this>`/`<context>` are register spellings, not JS
         let subject = if var_name.starts_with('<') {
             let e = self.operand_expr(&var_name);
             Self::render_stmt(&e)
