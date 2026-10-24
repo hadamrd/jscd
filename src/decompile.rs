@@ -6844,7 +6844,16 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                             self.regs = regs_save;
                             // 共享的尾部终结指令（如 pos/neg 共用的 Return）留给线性路径再发射一次
                             let skip_end = if tail_shared { ext - 1 } else { ext };
-                            if skip_end > t_idx {
+                            // other jumps land on the cold block too (a loop's exit in
+                            // `if (n > 0) { for (…) {…} } return x`): the linear path must
+                            // emit it again, or those paths fall off the end
+                            let t_off = self.instrs[t_idx].offset;
+                            let shared = self.instrs.iter().enumerate().any(|(k, x)| {
+                                k != i
+                                    && self.cond_jump_target(x).or_else(|| self.uncond_jump_target(x))
+                                        == Some(t_off)
+                            });
+                            if skip_end > t_idx && !shared {
                                 self.skip_spans.push((t_idx, skip_end));
                             }
                             r?;
