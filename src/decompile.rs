@@ -3883,6 +3883,16 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         self.acc_stored_reg = None;
     }
 
+    /// The accumulator still holds the value just stored at `loc`. When that value came
+    /// from a call (or anything with an effect), later uses of the accumulator (a phi at
+    /// a branch join, a chained `a.x = b.y = f()`) must read it back from `loc`, not
+    /// render the call again and run it twice.
+    fn acc_now_at(&mut self, loc: Expr) {
+        if self.acc.as_ref().is_some_and(|e| !reread_safe(e)) {
+            self.acc = Some(loc);
+        }
+    }
+
     // ───────────────────────── 生成器重写 ─────────────────────────
     //
     // V8 把 function* 编成一台状态机：序言建生成器对象并"起始挂起"，每个 yield 处
@@ -7780,8 +7790,9 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     obj: Box::new(obj),
                     key,
                 };
-                self.emit_assign(target, value, "=");
+                self.emit_assign(target.clone(), value, "=");
                 self.acc_consumed();
+                self.acc_now_at(target);
             }
             "StaKeyedProperty" | "SetKeyedProperty" | "StaKeyedPropertySloppy" | "StaKeyedPropertyStrict" => {
                 let obj = self.reg_expr(&arg(0));
@@ -7791,8 +7802,9 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     obj: Box::new(obj),
                     key: Key::Computed(Box::new(key)),
                 };
-                self.emit_assign(target, value, "=");
+                self.emit_assign(target.clone(), value, "=");
                 self.acc_consumed();
+                self.acc_now_at(target);
             }
             "StaGlobal" | "StaGlobalSloppy" | "StaGlobalStrict" => {
                 let name = idx_num(&arg(0))
@@ -7805,6 +7817,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 let name = sanitize_var(&name);
                 self.line(&format!("{name} = {};", value.render()));
                 self.acc_consumed();
+                self.acc_now_at(Expr::Ident(name));
             }
             // 宽松模式动态赋值：`StaLookupSlot [名], <flags>`（名字是**第一个**操作数）
             "StaLookupSlot" => {
