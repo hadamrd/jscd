@@ -5259,11 +5259,20 @@ impl<'a, 'b> FnCtx<'a, 'b> {
     fn store_named(&mut self, target: &str, e: Expr) {
         let rhs = Self::render_stmt(&e);
         self.line(&format!("{target} = {rhs};"));
+        self.forget_props_reading(target);
         if let Some(r) = target.strip_prefix('r').and_then(|s| s.parse::<u32>().ok()) {
             if self.regs.len() <= r as usize {
                 self.regs.resize(r as usize + 1, None);
             }
             self.regs[r as usize] = Some(Expr::Reg(r));
+        }
+    }
+
+    /// `o[k]` held for the `o.m(args)` rewrite is re-read at the call: once `name`
+    /// is overwritten, re-reading it would use the new value.
+    fn forget_props_reading(&mut self, name: &str) {
+        if !self.reg_prop.is_empty() {
+            self.reg_prop.retain(|_, m| !mentions_name(&m.render(), name));
         }
     }
 
@@ -7397,7 +7406,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     let r = reg_of(&arg(0));
                     self.store_reg(r, value.clone());
                     if let Some(m) = value {
-                        if matches!(m, Expr::Member { .. }) {
+                        if matches!(m, Expr::Member { .. }) && reread_safe(&m) {
                             self.reg_prop.insert(r, m);
                         }
                     }
@@ -7420,7 +7429,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 let r: u32 = base[4..].parse().unwrap_or(0);
                 self.store_reg(r, self.acc.clone());
                 if let Some(m) = self.acc.clone() {
-                    if matches!(m, Expr::Member { .. }) {
+                    if matches!(m, Expr::Member { .. }) && reread_safe(&m) {
                         self.reg_prop.insert(r, m);
                     }
                 }
@@ -8780,6 +8789,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             self.acc_stored_reg = None;
         }
         self.reg_prop.remove(&r);
+        self.forget_props_reading(&format!("r{r}"));
         if self.regs.len() <= r as usize {
             self.regs.resize(r as usize + 1, None);
         }
@@ -9398,9 +9408,27 @@ fn is_js_global(n: &str) -> bool {
     )
 }
 
+/// A property access that can be evaluated a second time with the same result
+/// and no side effect: no call, no assignment, only names, literals and members.
+fn reread_safe(e: &Expr) -> bool {
+    match e {
+        Expr::Num(_) | Expr::BigInt(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null
+        | Expr::Undefined | Expr::Ident(_) | Expr::Reg(_) => true,
+        Expr::Member { obj, key } => {
+            reread_safe(obj) && !matches!(key, Key::Computed(k) if !reread_safe(k))
+        }
+        _ => false,
+    }
+}
+
 /// 文本里是否引用了寄存器 `rN`（词边界匹配，`r1` 不会命中 `r10`）。
 fn mentions_reg(text: &str, r: u32) -> bool {
-    let needle = format!("r{r}");
+    mentions_name(text, &format!("r{r}"))
+}
+
+/// 文本里是否引用了标识符 `name`（词边界匹配）。
+fn mentions_name(text: &str, name: &str) -> bool {
+    let needle = name;
     let bytes = text.as_bytes();
     let mut from = 0;
     while let Some(pos) = text[from..].find(&needle) {

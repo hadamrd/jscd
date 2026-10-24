@@ -531,5 +531,21 @@
       ]
     ],
     "same_node_original": true
+  },
+  "method_key_call": {
+    "cases": [
+      [
+        "a-b-c",
+        1
+      ],
+      [
+        "ab-c",
+        0
+      ],
+      [
+        "x",
+        1
+      ]
+    ]
   }
 }
