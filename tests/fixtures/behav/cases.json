@@ -700,5 +700,40 @@
         0
       ]
     ]
+  },
+  "pushed_context_outer_read": {
+    "cases": [
+      [
+        "ab"
+      ],
+      [
+        "abcdef"
+      ]
+    ]
+  },
+  "async_param_in_block": {
+    "cases": [
+      [
+        "ab",
+        2
+      ],
+      [
+        "x",
+        0
+      ]
+    ]
+  },
+  "let_loop_closure_async": {
+    "cases": [
+      [
+        "ab",
+        2
+      ],
+      [
+        "x",
+        0
+      ]
+    ],
+    "known_fail": "per-iteration let copy-back emitted after PopContext (emission-order context tracking)"
   }
 }

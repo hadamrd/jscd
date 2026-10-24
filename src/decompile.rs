@@ -1006,7 +1006,9 @@ struct FnCtx<'a, 'b> {
     /// 最近一次 context 槽读取的槽号（供紧随其后的 TDZ 检查反推变量名）
     last_ctx_slot: Option<usize>,
     /// 槽号 → 变量名（由 TDZ 检查常量池反推，弥补外层 ScopeInfo 缺失）
-    slot_aliases: HashMap<usize, String>,
+    /// TDZ-derived slot names, keyed by (slot, context level): 0 = the current context,
+    /// d = d hops out from it, `usize::MAX` = a context held in a register (unknown level).
+    slot_aliases: HashMap<(usize, usize), String>,
     /// 生成器序言把参数搬进 context（`Ldar aK; StaCurrentContextSlot [S]`）——
     /// 序言被折叠掉之后，函数体里对槽 S 的读写要还原成参数名 `aK`
     /// （否则输出 `n` 这种源码名，而形参叫 a0 → 引用不到，count(2) 一次都不迭代）。
@@ -1939,7 +1941,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         // 预扫：V8 的 TDZ 检查（`X; ThrowReferenceErrorIfHole [池索引]`）紧跟在 context 槽
         // 读取之后 → 用它把槽号绑到变量名。模块/外层 ScopeInfo 不在链上时，这是拿到真名的
         // 唯一线索（否则满屏 `__ctx.ctx25`）。
-        let mut slot_aliases: HashMap<usize, String> = HashMap::new();
+        let mut slot_aliases: HashMap<(usize, usize), String> = HashMap::new();
+        let ctx_reg = d.table.frame.map(|f| f.context_index);
         for (k, ins) in instrs.iter().enumerate() {
             let b = ins.name.split('.').next().unwrap_or(&ins.name);
             let is_ctx_load = matches!(
@@ -1960,6 +1963,22 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 Some(Operand::Imm(v)) => *v as usize,
                 _ => continue,
             };
+            // which context the slot is in: a TDZ name for slot 9 of an outer context must
+            // not name slot 9 of the current one (an async closure's own wrappers were
+            // read as the module's imports)
+            let level = if b.contains("Current") {
+                0
+            } else {
+                let depth = match ins.operands.last() {
+                    Some(Operand::Idx(v)) => *v as usize,
+                    Some(Operand::Imm(v)) => *v as usize,
+                    _ => usize::MAX,
+                };
+                match ins.operands.first() {
+                    Some(Operand::Reg(r)) if Some(*r) == ctx_reg => depth,
+                    _ => usize::MAX,
+                }
+            };
             for nxt in instrs.iter().skip(k + 1).take(2) {
                 let nb = nxt.name.split('.').next().unwrap_or(&nxt.name);
                 if nb != "ThrowReferenceErrorIfHole" {
@@ -1977,7 +1996,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 if let Some(n) = name {
                     let v = sanitize_var(&n.replace(['<', '>'], "").replace('/', "_"));
                     if !v.is_empty() {
-                        slot_aliases.entry(slot).or_insert(v);
+                        slot_aliases.entry((slot, level)).or_insert(v);
                     }
                 }
                 break;
@@ -3746,6 +3765,23 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         }
     }
 
+    /// The scope `depth` context hops out from `start` (same counting as
+    /// `context_name_walk`).
+    fn context_walk_sid(&self, start: ObjId, depth: usize) -> Option<ObjId> {
+        let mut sid = start;
+        let mut hops = depth;
+        loop {
+            let scope = self.d.scope_by_id(sid)?;
+            if !scope.context_locals.is_empty() || scope.locals_table.is_some() {
+                if hops == 0 {
+                    return Some(sid);
+                }
+                hops -= 1;
+            }
+            sid = scope.outer?;
+        }
+    }
+
     /// 显式上下文读取（`LdaContextSlot rN, [slot], [depth]`）的名字：从 rN 持有的
     /// 上下文作用域出发。
     fn context_name_via_reg(&self, reg: u32, slot: usize, depth: usize, base: usize) -> Option<String> {
@@ -3793,7 +3829,17 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             }
         }
         // 由 TDZ 检查反推出的别名最可靠（外层/模块 ScopeInfo 常常不在链上）
-        if let Some(n) = self.slot_aliases.get(&slot) {
+        let alias = if via_current {
+            self.slot_aliases.get(&(slot, 0))
+        } else {
+            // explicit loads fall back here only when the precise walk failed: any level
+            self.slot_aliases
+                .iter()
+                .filter(|((s, _), _)| *s == slot)
+                .min_by_key(|((_, l), _)| if *l == 0 { usize::MAX - 1 } else { *l })
+                .map(|(_, n)| n)
+        };
+        if let Some(n) = alias {
             if std::env::var("JSCD_DBG_SLOT").is_ok() {
                 eprintln!("[slot] {slot} via_current={via_current} alias -> {n}");
             }
@@ -6329,7 +6375,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         // 槽 → 绑到同一个名字，否则参数叫 e、引用却是 `__ctx.ctx4`（≤7.x 的
         // MIN_CONTEXT_SLOTS 是 4，不能写死 2），运行时就变成 undefined.message。
         self.slot_aliases
-            .insert(self.d.table.min_context_slots, catch_var.clone());
+            .insert((self.d.table.min_context_slots, 0), catch_var.clone());
         self.line(&format!("}} catch ({catch_var}) {{"));
         self.indent += 1;
         if let Err(e) = self.emit_range(catch_start, catch_setup + 1) {
@@ -7866,7 +7912,25 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 } else {
                     self.d.table.min_context_slots
                 };
-                let nm = self.context_name_base(slot, true, base);
+                // the current scope is known (no context pushed, or a block/catch scope we
+                // have): name the slot from it. Going straight to the aliases named a
+                // per-iteration `let i` after the param copied into slot 2 (`i = ++a0`)
+                let catch_slot = slot == self.d.table.min_context_slots && self.catch_alias.is_some();
+                let known = self.ctx_scopes.last().map(|x| x.is_some()).unwrap_or(true);
+                let precise = if catch_slot || !known {
+                    None
+                } else {
+                    self.context_name_by_depth(slot, 0, base).map(|n| {
+                        let landed = self.ctx_scopes.last().copied().flatten().or(self.scope_id)
+                            .and_then(|st| self.context_walk_sid(st, 0));
+                        let own = self.scope_id.and_then(|st| self.context_walk_sid(st, 0));
+                        match self.gen_param_slots.get(&slot) {
+                            Some(p) if landed.is_some() && landed == own => p.clone(),
+                            _ => n,
+                        }
+                    })
+                };
+                let nm = precise.unwrap_or_else(|| self.context_name_base(slot, true, base));
                 if std::env::var("JSCD_DBG_SLOT").is_ok() {
                     eprintln!("[lda] slot={slot} -> {nm}");
                 }
@@ -7895,22 +7959,36 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 } else {
                     self.context_reg_slot_depth(&ops)
                         .and_then(|(r, _, d)| self.context_name_via_reg(r, slot, d, base))
-                }
+                };
                 // 形参拷贝槽优先用 `aK`：async/生成器的序言把形参搬进上下文槽，
                 // 摊平产物里形参是 `aK` 而**不是**源码名（这里算出 `q` 会让
                 // `await q` 变成未声明名字 → undefined；node8/10 的 async retry 就栽在这）。
-                .filter(|n| {
-                    self.gen_param_slots
-                        .get(&slot)
-                        .map(|p| p == n)
-                        .unwrap_or(true)
-                });
+                // Only for the function's own context: a read through a register that
+                // lands there (`PushContext r21` after a block context) is the param too,
+                // and dropping its name let a fallback pick another slot-4 name (`app`).
+                let landed = if ctx_is_current {
+                    self.ctx_scopes.last().copied().flatten().or(self.scope_id)
+                        .and_then(|st| self.context_walk_sid(st, depth))
+                } else {
+                    self.context_reg_slot_depth(&ops)
+                        .and_then(|(r, _, d)| self.reg_scope.get(&r).and_then(|&st| self.context_walk_sid(st, d)))
+                };
+                let own = self.scope_id.and_then(|st| self.context_walk_sid(st, 0));
+                let param = self.gen_param_slots.get(&slot).cloned();
+                let precise = match (&precise, &param) {
+                    (Some(_), Some(p)) if landed.is_some() && landed == own => Some(p.clone()),
+                    _ => precise.filter(|n| param.as_ref().map(|p| p == n).unwrap_or(true)),
+                };
                 if std::env::var("JSCD_DBG_SLOT").is_ok() {
                     eprintln!(
                         "[lda-explicit] base={base} ops={ops:?} depth={depth} precise={precise:?} fallback={:?}",
                         self.context_name_base(slot, false, base)
                     );
                 }
+                // no precise name: a TDZ name taken from a load of the same shape (same
+                // context register kind and depth) before any other level's
+                let level = if ctx_is_current { depth } else { usize::MAX };
+                let precise = precise.or_else(|| self.slot_aliases.get(&(slot, level)).cloned());
                 self.acc = Some(Expr::Ident(
                     precise.unwrap_or_else(|| self.context_name_base(slot, false, base)),
                 ));
@@ -7981,7 +8059,17 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 //   PushContext 留在 rX 里的外层上下文 —— 拿最内层解会读成 `rab`）。
                 let r = reg_of(&arg(0));
                 let len = self.ctx_scopes.len();
-                let prev = if len >= 2 { self.ctx_scopes[len - 2] } else { None };
+                // ctx_scopes holds block/catch contexts only, not the function's own
+                // (`CreateFunctionContext; PushContext r9`). Pushing that one saves the
+                // closure's context: the function scope's outer. Pushing the first block
+                // context saves the function's (the walk skips a scope without context).
+                // Without this, `rX` reads were named from the new scope (sendReports
+                // called a string wrapper instead of `isValidDate`)
+                let prev = match len {
+                    0 => self.scope_id.and_then(|sid| self.d.scope_by_id(sid)).and_then(|sc| sc.outer),
+                    1 => self.scope_id,
+                    _ => self.ctx_scopes[len - 2],
+                };
                 if std::env::var("JSCD_DBG_CTX").is_ok() {
                     eprintln!("[pushctx] r{r} len={len} ctx_scopes={:?} prev={prev:?}", self.ctx_scopes);
                 }
