@@ -690,5 +690,15 @@
         "abcdef"
       ]
     ]
+  },
+  "pushed_context_outer_read": {
+    "cases": [
+      [
+        "ab"
+      ],
+      [
+        "abcdef"
+      ]
+    ]
   }
 }
