@@ -547,5 +547,15 @@
         1
       ]
     ]
+  },
+  "store_then_join": {
+    "cases": [
+      [
+        true
+      ],
+      [
+        false
+      ]
+    ]
   }
 }
