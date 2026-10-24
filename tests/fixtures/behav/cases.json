@@ -531,5 +531,47 @@
       ]
     ],
     "same_node_original": true
+  },
+  "liveness_paths": {
+    "cases": [
+      [
+        0
+      ],
+      [
+        1
+      ],
+      [
+        3
+      ],
+      [
+        7
+      ]
+    ]
+  },
+  "method_key_call": {
+    "cases": [
+      [
+        "a-b-c",
+        1
+      ],
+      [
+        "ab-c",
+        0
+      ],
+      [
+        "x",
+        1
+      ]
+    ]
+  },
+  "store_then_join": {
+    "cases": [
+      [
+        true
+      ],
+      [
+        false
+      ]
+    ]
   }
 }

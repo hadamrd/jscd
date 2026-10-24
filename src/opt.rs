@@ -491,6 +491,51 @@ fn block_paths(lines: &[String]) -> Vec<Vec<u32>> {
     out
 }
 
+/// Registers each line must keep: those a catch or finally of an enclosing `try` reads.
+/// A store in a try body is not dead just because a later store on the same path
+/// overwrites it: a throw (any call) between them lands in the handler, which reads it
+/// (`try { r3 = 5; if (c) throw e; r3 = 7 } catch { use(r3) }`).
+fn try_protected(lines: &[String], parsed: &[Line]) -> Vec<HashSet<usize>> {
+    // frame kinds: 0 = other block, 1 = try body, 2 = catch / finally (of try `tr`)
+    let mut stack: Vec<(u8, usize)> = Vec::new();
+    let mut regs: Vec<HashSet<usize>> = Vec::new(); // per try: registers its handlers read
+    let mut in_body: Vec<Vec<usize>> = vec![Vec::new(); lines.len()];
+    for (i, l) in lines.iter().enumerate() {
+        for &(kind, tr) in &stack {
+            match kind {
+                1 => in_body[i].push(tr),
+                2 => regs[tr].extend(reads_in(&parsed[i]).into_keys()),
+                _ => {}
+            }
+        }
+        let t = strip_lexical(l);
+        let mut popped: Option<(u8, usize)> = None;
+        for (k, ch) in t.char_indices() {
+            match ch {
+                '}' => popped = stack.pop(),
+                '{' => {
+                    let head = t[..k].trim_end();
+                    if head.ends_with("try") {
+                        regs.push(HashSet::new());
+                        stack.push((1, regs.len() - 1));
+                    } else if (head.contains("catch") || head.ends_with("finally"))
+                        && matches!(popped, Some((1 | 2, _)))
+                    {
+                        stack.push((2, popped.unwrap().1));
+                    } else {
+                        stack.push((0, 0));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    in_body
+        .into_iter()
+        .map(|trs| trs.iter().flat_map(|&x| regs[x].iter().copied()).collect())
+        .collect()
+}
+
 /// 每个下标所属的"函数区域"：顶格开始的函数（或 `var X = class`）另起一个区域，
 /// 顶层代码是区域 0。寄存器按函数编号，跨区域统计读次数会多算（挡住本可以做的优化）。
 fn regions(lines: &[String]) -> Vec<usize> {
@@ -866,6 +911,11 @@ fn rebuild_calls(lines: &mut Vec<String>) {
             if ctx.as_target {
                 break;
             }
+            // 求值顺序：并进去之后，`rhs` 排在这行里它前面那段之后求值
+            if reorders(&rhs, &cur[..ctx.at]) {
+                if std::env::var("JSCD_DBG7").is_ok() { eprintln!("[7] L={li} prev={prev} reg={reg} stop: order"); }
+                break;
+            }
             let text = paren_if_needed(&rhs, ctx.after_new);
             let Some(next) = replace_reg(&cur, reg, &text) else { break };
             cur = next;
@@ -893,6 +943,156 @@ fn rebuild_calls(lines: &mut Vec<String>) {
         out.push(rewritten.remove(&i).unwrap_or_else(|| l.clone()));
     }
     *lines = out;
+}
+
+/// Inlining `rhs` at the end of `prefix` evaluates `prefix` first, though `rhs` ran
+/// first in the source. That is wrong when one side has an effect the other sees:
+/// `r0 = f(); r1 = x; return r1 + r0` must not become `return x + f()`.
+fn reorders(rhs: &str, prefix: &str) -> bool {
+    let (rhs_effect, rhs_read) = effects_and_reads(rhs, false);
+    if !rhs_effect && !rhs_read {
+        return false;
+    }
+    // `new <here>(…)`: the object is built after the callee is read
+    let p = prefix.trim_end();
+    let prefix = match p.strip_suffix("new") {
+        Some(rest) if !rest.ends_with(|c: char| is_ident_byte(c as u8)) => rest,
+        _ => prefix,
+    };
+    let (pre_effect, pre_read) = effects_and_reads(prefix, true);
+    pre_effect || (rhs_effect && pre_read)
+}
+
+/// Does `text` do something another expression could observe (a call, `new`, an
+/// assignment, an update), and does it read state such a thing could change (a
+/// global or captured name, a property)? Registers, parameters, phis, temps and
+/// literals are local and never change behind our back. With `open_calls`, the
+/// callee of a call still open at the end of `text` (`console.log(`) is skipped:
+/// its call runs after what follows, and its callee was loaded first in the source.
+fn effects_and_reads(text: &str, open_calls: bool) -> (bool, bool) {
+    let t: Vec<char> = strip_lexical(text).chars().collect();
+    // callee spans of calls still open at the end
+    let mut exempt = vec![false; t.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut effect = false;
+    for (i, &c) in t.iter().enumerate() {
+        match c {
+            '(' => stack.push(i),
+            ')' => {
+                if let Some(o) = stack.pop() {
+                    let mut j = o;
+                    while j > 0 && t[j - 1] == ' ' {
+                        j -= 1;
+                    }
+                    if j > 0 && (is_ident_byte(t[j - 1] as u8) || t[j - 1] == ')' || t[j - 1] == ']') {
+                        effect = true; // a completed call
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !open_calls && !stack.is_empty() {
+        effect = true;
+    }
+    if open_calls {
+        for &o in &stack {
+            let mut j = o;
+            while j > 0 && (is_ident_byte(t[j - 1] as u8) || t[j - 1] == '.') {
+                j -= 1;
+                exempt[j] = true;
+            }
+            // `new C(`: like a call, it constructs after its arguments
+            let mut k = j;
+            while k > 0 && t[k - 1] == ' ' {
+                k -= 1;
+            }
+            if k >= 3 && t[k - 3..k].iter().collect::<String>() == "new"
+                && (k == 3 || !is_ident_byte(t[k - 4] as u8))
+            {
+                for e in &mut exempt[k - 3..k] {
+                    *e = true;
+                }
+            }
+        }
+    }
+    let s: String = t.iter().collect();
+    if s.contains("++") || s.contains("--") {
+        effect = true;
+    }
+    for (i, &c) in t.iter().enumerate() {
+        if c == '=' {
+            let p = if i > 0 { t[i - 1] } else { ' ' };
+            let n = t.get(i + 1).copied().unwrap_or(' ');
+            if matches!(n, '=' | '>') || matches!(p, '=' | '!') || (matches!(p, '<' | '>') && !s[..i].ends_with("<<") && !s[..i].ends_with(">>")) {
+                continue; // comparison or arrow
+            }
+            if open_calls {
+                // a prefix: the store happens after what we insert, a plain
+                // target is not even read (`x = <here>`)
+                if p == ' ' || is_ident_byte(p as u8) {
+                    let mut j = i;
+                    while j > 0 && t[j - 1] == ' ' {
+                        j -= 1;
+                    }
+                    let mut k = j;
+                    while k > 0 && is_ident_byte(t[k - 1] as u8) {
+                        k -= 1;
+                    }
+                    if k < j && (k == 0 || t[k - 1] != '.') {
+                        for e in &mut exempt[k..j] {
+                            *e = true;
+                        }
+                    }
+                }
+            } else {
+                effect = true;
+            }
+        }
+    }
+    let mut read = false;
+    let mut i = 0;
+    while i < t.len() {
+        let c = t[i];
+        if c == ']' && !exempt[i] {
+            read = true; // a computed member read (or an array literal: conservative)
+        }
+        if is_ident_byte(c as u8) && !c.is_ascii_digit() {
+            let start = i;
+            while i < t.len() && is_ident_byte(t[i] as u8) {
+                i += 1;
+            }
+            let word: String = t[start..i].iter().collect();
+            let after_dot = start > 0 && t[start - 1] == '.';
+            if exempt[start] {
+                continue;
+            }
+            match word.as_str() {
+                "new" | "delete" | "await" | "yield" => effect = true,
+                _ if after_dot => read = true,
+                _ if !local_or_constant(&word) => read = true,
+                _ => {}
+            }
+            continue;
+        }
+        i += 1;
+    }
+    (effect, read)
+}
+
+/// Names whose value no call can change: registers, parameters, phis, temps,
+/// literals, keywords, and the builtins a program does not reassign.
+fn local_or_constant(w: &str) -> bool {
+    let numbered = |p: &str| w.strip_prefix(p).is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+    numbered("r") || numbered("a") || numbered("phi") || numbered("t") || w == "S"
+        || matches!(
+            w,
+            "return" | "typeof" | "void" | "in" | "instanceof" | "this" | "true" | "false" | "null"
+                | "undefined" | "NaN" | "Infinity" | "throw" | "let" | "const" | "var" | "of"
+                | "String" | "Number" | "Boolean" | "Object" | "Array" | "Math" | "JSON" | "Symbol"
+                | "Promise" | "Error" | "TypeError" | "RangeError" | "Date" | "RegExp" | "Map" | "Set"
+                | "WeakMap" | "WeakSet" | "parseInt" | "parseFloat" | "isNaN" | "BigInt" | "Reflect"
+        )
 }
 
 /// `rhs` 依赖的寄存器/标识符，是否被**已经并进去的那些行**（`inlined`，它们会搬到调用点、
@@ -945,6 +1145,8 @@ fn ident_words(s: &str) -> Vec<String> {
 struct OccurCtx {
     after_new: bool,
     as_target: bool,
+    /// 出现位置（字节偏移）
+    at: usize,
 }
 
 /// 找 `rN` 在行里的**唯一**出现并判断上下文；找不到/多处出现返回 `None`。
@@ -975,6 +1177,7 @@ fn occurrence_context(line: &str, reg: usize) -> Option<OccurCtx> {
     Some(OccurCtx {
         after_new: before.ends_with("new"),
         as_target,
+        at,
     })
 }
 
@@ -1261,6 +1464,7 @@ fn optimize_once(lines: &mut Vec<String>) {
     // "之后再没出现过" 误判（后一个区域的写被当成前一个区域那次写的覆盖者）。
     let mut next: HashMap<(usize, usize), (Next, usize)> = HashMap::new();
     let paths = block_paths(lines);
+    let protected = try_protected(lines, &parsed);
     // ⑥ 方法加载中转（渲染副产品）先标出来：后面两条规则都该当它不存在
     let mut drop_idx: HashSet<usize> = call_scratch_lines(&parsed, lines, &region);
     for i in (0..parsed.len()).rev() {
@@ -1270,7 +1474,7 @@ fn optimize_once(lines: &mut Vec<String>) {
             // 之后的动作是"写"（且那次写在**同一块路径**上 —— 否则是互斥分支，值还活着），
             // 或者之后再没出现过（纯右值时删掉不影响行为）→ 这次写的值没人要
             let dead = match next.get(&key) {
-                Some((Next::Write, j)) => paths[i] == paths[*j],
+                Some((Next::Write, j)) => paths[i] == paths[*j] && !protected[i].contains(reg),
                 None => true,
                 Some((Next::Read, _)) => false,
             };
@@ -1534,6 +1738,17 @@ mod tests {
         let out = optimize(src);
         assert!(!out.contains("r1 = r0;"), "链会被并掉：{out}");
         assert!(out.contains("new C(a0)"), "整条链要重建到 C：{out}");
+    }
+
+    #[test]
+    fn does_not_move_a_call_past_a_global_read() {
+        // `f()` may change `x`: it must still run before `x` is read
+        let src = "let r0, r1;\nr0 = f();\nr1 = x;\nreturn r1 + r0;\n";
+        let out = optimize(src);
+        assert!(!out.contains("x + f()"), "call moved past a read: {out}");
+        let src2 = "let r0, r1;\nr0 = f();\nr1 = g();\nreturn r1 + r0;\n";
+        let out2 = optimize(src2);
+        assert!(!out2.contains("g() + f()"), "calls swapped: {out2}");
     }
 
     #[test]

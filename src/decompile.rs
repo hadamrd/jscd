@@ -3922,6 +3922,16 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         self.acc_stored_reg = None;
     }
 
+    /// The accumulator still holds the value just stored at `loc`. When that value came
+    /// from a call (or anything with an effect), later uses of the accumulator (a phi at
+    /// a branch join, a chained `a.x = b.y = f()`) must read it back from `loc`, not
+    /// render the call again and run it twice.
+    fn acc_now_at(&mut self, loc: Expr) {
+        if self.acc.as_ref().is_some_and(|e| !reread_safe(e)) {
+            self.acc = Some(loc);
+        }
+    }
+
     // ───────────────────────── 生成器重写 ─────────────────────────
     //
     // V8 把 function* 编成一台状态机：序言建生成器对象并"起始挂起"，每个 yield 处
@@ -5436,11 +5446,20 @@ impl<'a, 'b> FnCtx<'a, 'b> {
     fn store_named(&mut self, target: &str, e: Expr) {
         let rhs = Self::render_stmt(&e);
         self.line(&format!("{target} = {rhs};"));
+        self.forget_props_reading(target);
         if let Some(r) = target.strip_prefix('r').and_then(|s| s.parse::<u32>().ok()) {
             if self.regs.len() <= r as usize {
                 self.regs.resize(r as usize + 1, None);
             }
             self.regs[r as usize] = Some(Expr::Reg(r));
+        }
+    }
+
+    /// `o[k]` held for the `o.m(args)` rewrite is re-read at the call: once `name`
+    /// is overwritten, re-reading it would use the new value.
+    fn forget_props_reading(&mut self, name: &str) {
+        if !self.reg_prop.is_empty() {
+            self.reg_prop.retain(|_, m| !mentions_name(&m.render(), name));
         }
     }
 
@@ -7574,7 +7593,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     let r = reg_of(&arg(0));
                     self.store_reg(r, value.clone());
                     if let Some(m) = value {
-                        if matches!(m, Expr::Member { .. }) {
+                        if matches!(m, Expr::Member { .. }) && reread_safe(&m) {
                             self.reg_prop.insert(r, m);
                         }
                     }
@@ -7597,7 +7616,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 let r: u32 = base[4..].parse().unwrap_or(0);
                 self.store_reg(r, self.acc.clone());
                 if let Some(m) = self.acc.clone() {
-                    if matches!(m, Expr::Member { .. }) {
+                    if matches!(m, Expr::Member { .. }) && reread_safe(&m) {
                         self.reg_prop.insert(r, m);
                     }
                 }
@@ -7831,8 +7850,9 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     obj: Box::new(obj),
                     key,
                 };
-                self.emit_assign(target, value, "=");
+                self.emit_assign(target.clone(), value, "=");
                 self.acc_consumed();
+                self.acc_now_at(target);
             }
             "StaKeyedProperty" | "SetKeyedProperty" | "StaKeyedPropertySloppy" | "StaKeyedPropertyStrict" => {
                 let obj = self.reg_expr(&arg(0));
@@ -7842,8 +7862,9 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     obj: Box::new(obj),
                     key: Key::Computed(Box::new(key)),
                 };
-                self.emit_assign(target, value, "=");
+                self.emit_assign(target.clone(), value, "=");
                 self.acc_consumed();
+                self.acc_now_at(target);
             }
             "StaGlobal" | "StaGlobalSloppy" | "StaGlobalStrict" => {
                 let name = idx_num(&arg(0))
@@ -7856,6 +7877,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 let name = sanitize_var(&name);
                 self.line(&format!("{name} = {};", value.render()));
                 self.acc_consumed();
+                self.acc_now_at(Expr::Ident(name));
             }
             // 宽松模式动态赋值：`StaLookupSlot [名], <flags>`（名字是**第一个**操作数）
             "StaLookupSlot" => {
@@ -8962,6 +8984,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             self.acc_stored_reg = None;
         }
         self.reg_prop.remove(&r);
+        self.forget_props_reading(&format!("r{r}"));
         if self.regs.len() <= r as usize {
             self.regs.resize(r as usize + 1, None);
         }
@@ -9580,9 +9603,27 @@ fn is_js_global(n: &str) -> bool {
     )
 }
 
+/// A property access that can be evaluated a second time with the same result
+/// and no side effect: no call, no assignment, only names, literals and members.
+fn reread_safe(e: &Expr) -> bool {
+    match e {
+        Expr::Num(_) | Expr::BigInt(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null
+        | Expr::Undefined | Expr::Ident(_) | Expr::Reg(_) => true,
+        Expr::Member { obj, key } => {
+            reread_safe(obj) && !matches!(key, Key::Computed(k) if !reread_safe(k))
+        }
+        _ => false,
+    }
+}
+
 /// 文本里是否引用了寄存器 `rN`（词边界匹配，`r1` 不会命中 `r10`）。
 fn mentions_reg(text: &str, r: u32) -> bool {
-    let needle = format!("r{r}");
+    mentions_name(text, &format!("r{r}"))
+}
+
+/// 文本里是否引用了标识符 `name`（词边界匹配）。
+fn mentions_name(text: &str, name: &str) -> bool {
+    let needle = name;
     let bytes = text.as_bytes();
     let mut from = 0;
     while let Some(pos) = text[from..].find(&needle) {
