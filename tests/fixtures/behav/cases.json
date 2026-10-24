@@ -677,5 +677,18 @@
         ]
       ]
     ]
+  },
+  "null_default_else_check": {
+    "cases": [
+      [
+        null
+      ],
+      [
+        "ab"
+      ],
+      [
+        "abcdef"
+      ]
+    ]
   }
 }

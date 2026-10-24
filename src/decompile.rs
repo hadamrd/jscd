@@ -6951,7 +6951,16 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     if t_idx > i && self.is_detached(t_idx) {
                         let (ext_raw, tail_shared) = self.detached_extent(t_idx, end);
                         let ext = ext_raw.min(end);
-                        if ext > t_idx && self.block_terminates(ext - 1) && self.self_contained(t_idx, ext)
+                        // and every path through it ends there: a jump from inside to the
+                        // join (`if (a == null) a = d(); else if (!ok(a)) return;`) means
+                        // some paths go on after the if, not into the code that follows here
+                        let escapes = (t_idx..ext).any(|k| {
+                            self.cond_jump_target(&self.instrs[k])
+                                .or_else(|| self.uncond_jump_target(&self.instrs[k]))
+                                .and_then(|t| self.idx_of.get(&t))
+                                .is_some_and(|&ti| ti >= ext)
+                        });
+                        if ext > t_idx && self.block_terminates(ext - 1) && self.self_contained(t_idx, ext) && !escapes
                         {
                             let acc_save = self.acc.clone();
                             let acc_stored_save = self.acc_stored;
