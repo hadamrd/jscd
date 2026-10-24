@@ -491,6 +491,51 @@ fn block_paths(lines: &[String]) -> Vec<Vec<u32>> {
     out
 }
 
+/// Registers each line must keep: those a catch or finally of an enclosing `try` reads.
+/// A store in a try body is not dead just because a later store on the same path
+/// overwrites it: a throw (any call) between them lands in the handler, which reads it
+/// (`try { r3 = 5; if (c) throw e; r3 = 7 } catch { use(r3) }`).
+fn try_protected(lines: &[String], parsed: &[Line]) -> Vec<HashSet<usize>> {
+    // frame kinds: 0 = other block, 1 = try body, 2 = catch / finally (of try `tr`)
+    let mut stack: Vec<(u8, usize)> = Vec::new();
+    let mut regs: Vec<HashSet<usize>> = Vec::new(); // per try: registers its handlers read
+    let mut in_body: Vec<Vec<usize>> = vec![Vec::new(); lines.len()];
+    for (i, l) in lines.iter().enumerate() {
+        for &(kind, tr) in &stack {
+            match kind {
+                1 => in_body[i].push(tr),
+                2 => regs[tr].extend(reads_in(&parsed[i]).into_keys()),
+                _ => {}
+            }
+        }
+        let t = strip_lexical(l);
+        let mut popped: Option<(u8, usize)> = None;
+        for (k, ch) in t.char_indices() {
+            match ch {
+                '}' => popped = stack.pop(),
+                '{' => {
+                    let head = t[..k].trim_end();
+                    if head.ends_with("try") {
+                        regs.push(HashSet::new());
+                        stack.push((1, regs.len() - 1));
+                    } else if (head.contains("catch") || head.ends_with("finally"))
+                        && matches!(popped, Some((1 | 2, _)))
+                    {
+                        stack.push((2, popped.unwrap().1));
+                    } else {
+                        stack.push((0, 0));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    in_body
+        .into_iter()
+        .map(|trs| trs.iter().flat_map(|&x| regs[x].iter().copied()).collect())
+        .collect()
+}
+
 /// 每个下标所属的"函数区域"：顶格开始的函数（或 `var X = class`）另起一个区域，
 /// 顶层代码是区域 0。寄存器按函数编号，跨区域统计读次数会多算（挡住本可以做的优化）。
 fn regions(lines: &[String]) -> Vec<usize> {
@@ -1419,6 +1464,7 @@ fn optimize_once(lines: &mut Vec<String>) {
     // "之后再没出现过" 误判（后一个区域的写被当成前一个区域那次写的覆盖者）。
     let mut next: HashMap<(usize, usize), (Next, usize)> = HashMap::new();
     let paths = block_paths(lines);
+    let protected = try_protected(lines, &parsed);
     // ⑥ 方法加载中转（渲染副产品）先标出来：后面两条规则都该当它不存在
     let mut drop_idx: HashSet<usize> = call_scratch_lines(&parsed, lines, &region);
     for i in (0..parsed.len()).rev() {
@@ -1428,7 +1474,7 @@ fn optimize_once(lines: &mut Vec<String>) {
             // 之后的动作是"写"（且那次写在**同一块路径**上 —— 否则是互斥分支，值还活着），
             // 或者之后再没出现过（纯右值时删掉不影响行为）→ 这次写的值没人要
             let dead = match next.get(&key) {
-                Some((Next::Write, j)) => paths[i] == paths[*j],
+                Some((Next::Write, j)) => paths[i] == paths[*j] && !protected[i].contains(reg),
                 None => true,
                 Some((Next::Read, _)) => false,
             };
