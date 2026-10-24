@@ -1465,6 +1465,15 @@ var __uncompiled = new Proxy({}, { get: () => function () {} });
         if with_runtime && !alias.is_empty() {
             let _ = w.write_str(&alias);
         }
+        // `JSCD_SFI_NAMES=<file>`: each SFI id with the name its function is emitted
+        // under, to join with `jscd functions --json` (which has the nesting)
+        if let Some(path) = std::env::var_os("JSCD_SFI_NAMES") {
+            let names: serde_json::Map<String, serde_json::Value> = (0..self.cache.objects.len())
+                .filter(|id| self.cache.obj(*id).ty.is(self.table, "SharedFunctionInfo"))
+                .map(|id| (id.to_string(), serde_json::Value::String(self.function_emit_name(id))))
+                .collect();
+            let _ = std::fs::write(path, serde_json::Value::Object(names).to_string());
+        }
         for id in 0..self.cache.objects.len() {
             if !self.cache.obj(id).ty.is(self.table, "SharedFunctionInfo") {
                 continue;
