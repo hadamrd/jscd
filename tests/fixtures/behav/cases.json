@@ -573,5 +573,132 @@
         false
       ]
     ]
+  },
+  "switch_computed_cases": {
+    "cases": [
+      [
+        "a"
+      ],
+      [
+        "b"
+      ],
+      [
+        "c"
+      ],
+      [
+        "z"
+      ]
+    ]
+  },
+  "or_guard_return": {
+    "cases": [
+      [
+        "x",
+        0
+      ],
+      [
+        "x",
+        1
+      ],
+      [
+        "",
+        0
+      ],
+      [
+        "y",
+        2
+      ],
+      [
+        "y",
+        5
+      ]
+    ]
+  },
+  "or_test_in_for": {
+    "cases": [
+      [
+        [
+          "a",
+          "a.exe",
+          "b",
+          "a"
+        ],
+        "a"
+      ],
+      [
+        [
+          "x",
+          "y"
+        ],
+        "y"
+      ],
+      [
+        [],
+        "z"
+      ]
+    ]
+  },
+  "labeled_block_paths": {
+    "cases": [
+      [
+        0
+      ],
+      [
+        1
+      ],
+      [
+        2
+      ]
+    ]
+  },
+  "guard_shared_tail": {
+    "cases": [
+      [
+        [
+          "a",
+          "b",
+          "c"
+        ],
+        [
+          "c",
+          "a"
+        ]
+      ],
+      [
+        [
+          "a"
+        ],
+        []
+      ],
+      [
+        [],
+        [
+          "x"
+        ]
+      ]
+    ]
+  },
+  "null_default_else_check": {
+    "cases": [
+      [
+        null
+      ],
+      [
+        "ab"
+      ],
+      [
+        "abcdef"
+      ]
+    ]
+  },
+  "else_tail_call": {
+    "cases": [
+      [
+        2
+      ],
+      [
+        0
+      ]
+    ]
   }
 }

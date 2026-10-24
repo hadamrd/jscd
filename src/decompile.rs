@@ -972,6 +972,8 @@ struct LoopCtx {
     break_target: usize,
     /// 循环标签（内层 `break outer` 需要 `break L1;`）。没嵌套循环是为空串。
     label: String,
+    /// a labeled block `L: { … }`, not a loop: only `break L;` reaches it
+    is_block: bool,
 }
 
 struct FnCtx<'a, 'b> {
@@ -1042,6 +1044,11 @@ struct FnCtx<'a, 'b> {
     async_dispatch: Option<(usize, usize)>,
     /// 已被 try/finally 规则消费的 handler 起点（旧 try/catch 规则不再重复包）
     used_handler_starts: Vec<usize>,
+    /// Blocks already emitted where their only jump is (start index → end index): the
+    /// range they sit in skips them.
+    inlined_blocks: HashMap<usize, usize>,
+    /// Jump target offset → number of jumps landing there (built on first use).
+    jump_target_count: Option<HashMap<usize, usize>>,
     /// emit_range 递归深度（护栏，防栈溢出）
     emit_depth: usize,
     /// 寄存器 → 它当前持有的属性访问表达式（`r2 = o.m` → `r2 => o.m`）。
@@ -1065,6 +1072,8 @@ struct FnCtx<'a, 'b> {
     /// 刚创建的上下文（等待 Star/Mov 落进寄存器后登记到 reg_scope）
     pending_ctx: Option<ObjId>,
     label_counter: usize,
+    /// cond jumps already wrapped in a labeled block (see `try_or_guard`)
+    or_guard_done: HashSet<usize>,
     tmp_counter: usize,
     /// 分支间物化的累加器变量（phi）
     phi_vars: Vec<String>,
@@ -2089,6 +2098,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             is_async_gen: false,
             async_dispatch: None,
             used_handler_starts: Vec::new(),
+            inlined_blocks: HashMap::new(),
+            jump_target_count: None,
             emit_depth: 0,
             reg_prop: HashMap::new(),
             out: String::new(),
@@ -2100,6 +2111,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             reg_scope: HashMap::new(),
             pending_ctx: None,
             label_counter: 0,
+            or_guard_done: HashSet::new(),
             tmp_counter: 0,
             phi_vars: Vec::new(),
             skip_to: None,
@@ -6534,7 +6546,12 @@ impl<'a, 'b> FnCtx<'a, 'b> {
     }
 
     fn emit_range_inner(&mut self, mut i: usize, end: usize) -> Result<(), String> {
+        let start = i;
         while i < end {
+            if let Some(&bend) = self.inlined_blocks.get(&i) {
+                i = bend.max(i + 1);
+                continue;
+            }
             let ins = self.instrs[i].clone();
             let base = ins.name.split('.').next().unwrap_or(&ins.name).to_string();
 
@@ -6822,6 +6839,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     continue_target: ins.offset,
                     break_target: exit_target,
                     label: label.clone(),
+                    is_block: false,
                 });
                 // 循环头指令要放在循环体内：`continue` 回到顶部时需要重新求值（条件计算就在头部）
                 self.emit_expr_statement(&ins);
@@ -6853,6 +6871,12 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 continue;
             }
 
+            // ③-1 `if (!a || !b) return x;`: see try_or_guard
+            if let Some(next) = self.try_or_guard(i, end) {
+                i = next.max(i + 1);
+                continue;
+            }
+
             // ③ 条件跳转
             if let Some(target) = self.cond_jump_target(&ins) {
                 self.flush_acc_before(&base);
@@ -6877,11 +6901,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     .rposition(|l| l.break_target == target)
                     .map(|idx| (idx, self.loops[idx].label.clone()));
                 if let Some((idx, label)) = brk {
-                    let stmt = if idx + 1 == self.loops.len() || label.is_empty() {
-                        "break;".to_string()
-                    } else {
-                        format!("break {label};")
-                    };
+                    let stmt = self.break_stmt(idx, &label);
                     self.line(&format!("if ({cond}) {stmt}"));
                     i += 1;
                     continue;
@@ -6931,7 +6951,16 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     if t_idx > i && self.is_detached(t_idx) {
                         let (ext_raw, tail_shared) = self.detached_extent(t_idx, end);
                         let ext = ext_raw.min(end);
-                        if ext > t_idx && self.block_terminates(ext - 1) && self.self_contained(t_idx, ext)
+                        // and every path through it ends there: a jump from inside to the
+                        // join (`if (a == null) a = d(); else if (!ok(a)) return;`) means
+                        // some paths go on after the if, not into the code that follows here
+                        let escapes = (t_idx..ext).any(|k| {
+                            self.cond_jump_target(&self.instrs[k])
+                                .or_else(|| self.uncond_jump_target(&self.instrs[k]))
+                                .and_then(|t| self.idx_of.get(&t))
+                                .is_some_and(|&ti| ti >= ext)
+                        });
+                        if ext > t_idx && self.block_terminates(ext - 1) && self.self_contained(t_idx, ext) && !escapes
                         {
                             let acc_save = self.acc.clone();
                             let acc_stored_save = self.acc_stored;
@@ -6963,7 +6992,16 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                             self.regs = regs_save;
                             // 共享的尾部终结指令（如 pos/neg 共用的 Return）留给线性路径再发射一次
                             let skip_end = if tail_shared { ext - 1 } else { ext };
-                            if skip_end > t_idx {
+                            // other jumps land on the cold block too (a loop's exit in
+                            // `if (n > 0) { for (…) {…} } return x`): the linear path must
+                            // emit it again, or those paths fall off the end
+                            let t_off = self.instrs[t_idx].offset;
+                            let shared = self.instrs.iter().enumerate().any(|(k, x)| {
+                                k != i
+                                    && self.cond_jump_target(x).or_else(|| self.uncond_jump_target(x))
+                                        == Some(t_off)
+                            });
+                            if skip_end > t_idx && !shared {
                                 self.skip_spans.push((t_idx, skip_end));
                             }
                             r?;
@@ -7078,7 +7116,10 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                         // 有 else 时看两个分支是否给出不同值（默认参数 `b = 2` 的
                         // 形态里 else 恰好把 acc 还原成入口值，只比入口会漏 phi）；
                         // 没有 else 时只能跟入口比。
-                        let changed = if has_else { then_v != cur } else { cur != entry };
+                        let else_effect = has_else
+                            && !self.acc_stored
+                            && self.acc.as_ref().is_some_and(|e| e.has_effect());
+                        let changed = if has_else { then_v != cur || else_effect } else { cur != entry };
                         if std::env::var("JSCD_DBG_IF").is_ok() {
                             eprintln!(
                                 "[if] i={i} target={target} then={then_v:?} else={cur:?} entry={entry:?} changed={changed} has_else={has_else}"
@@ -7161,11 +7202,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                         .map(|idx| (idx, self.loops[idx].label.clone()))
                     {
                         self.flush_acc_at_edge(target);
-                        if idx + 1 == self.loops.len() || label.is_empty() {
-                            self.line("break;");
-                        } else {
-                            self.line(&format!("break {label};"));
-                        }
+                        let stmt = self.break_stmt(idx, &label);
+                        self.line(&stmt);
                     } else {
                         self.line(&format!("/* 回边 @{target}（未识别的循环结构） */"));
                     }
@@ -7179,10 +7217,34 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     .map(|idx| (idx, self.loops[idx].label.clone()))
                 {
                     self.flush_acc_before(&base);
-                    if idx + 1 == self.loops.len() || label.is_empty() {
-                        self.line("break;");
-                    } else {
-                        self.line(&format!("break {label};"));
+                    let stmt = self.break_stmt(idx, &label);
+                    self.line(&stmt);
+                }
+                // A forward jump out of this range (a switch case's `break` to the join,
+                // with the next case's body laid out right after it): what follows is
+                // only reached by jumps from outside the range, which emit it themselves.
+                // Unless something earlier in the range jumps into it, stop here;
+                // carrying on runs every later case (`case a: x; break; case b: y` → x; y).
+                if let Some(&t_idx) = self.idx_of.get(&target) {
+                    // the block it lands on has no other way in (a switch's `default`
+                    // placed after the cases): it runs here, nowhere else
+                    if t_idx >= end {
+                        if let Some(bend) = self.owned_block(t_idx) {
+                            self.flush_acc_before(&base);
+                            self.emit_range(t_idx, bend)?;
+                            self.inlined_blocks.insert(t_idx, bend);
+                            if !self.jumps_into(start, i, i + 1, end) {
+                                i = end;
+                            } else {
+                                i += 1;
+                            }
+                            continue;
+                        }
+                    }
+                    if t_idx >= end && i + 1 < end && !self.jumps_into(start, i, i + 1, end) {
+                        self.flush_acc_before(&base);
+                        i = end;
+                        continue;
                     }
                 }
                 // 其他前向 Jump：通常是 if 的尾部跳转，已由 ③ 消费
@@ -7213,8 +7275,11 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             _ => self.acc.as_ref().map(|e| e.render()),
         };
         let b = before.as_ref().map(|e| e.render()).unwrap_or_default();
+        // a pending call is this branch's own evaluation, even when its text matches the
+        // other branch's: `if (c) send("ok", x) else send("err", y)` both leave `r0(r1, r2)`
+        let effect = !self.acc_stored && self.acc.as_ref().is_some_and(|e| e.has_effect());
         if let Some(a) = cur {
-            if a != b && !a.is_empty() {
+            if (a != b || effect) && !a.is_empty() {
                 self.line(&format!("{phi} = {a};"));
             }
         }
@@ -7338,6 +7403,58 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         Some((back, exit))
     }
 
+    /// The block starting at instruction `t` when exactly one jump reaches it and the
+    /// instruction before it cannot fall into it: its end (exclusive), at the first
+    /// jump target or after the first unconditional exit.
+    fn owned_block(&mut self, t: usize) -> Option<usize> {
+        if t == 0 || t >= self.instrs.len() || self.inlined_blocks.contains_key(&t) {
+            return None;
+        }
+        if self.jump_target_count.is_none() {
+            let mut m: HashMap<usize, usize> = HashMap::new();
+            for ins in &self.instrs {
+                if let Some(x) = self.cond_jump_target(ins).or_else(|| self.uncond_jump_target(ins)) {
+                    *m.entry(x).or_default() += 1;
+                }
+            }
+            self.jump_target_count = Some(m);
+        }
+        let counts = self.jump_target_count.as_ref()?;
+        if counts.get(&self.instrs[t].offset).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        let exits = |ins: &Instr| {
+            let b = ins.name.split('.').next().unwrap_or(&ins.name);
+            matches!(b, "Return" | "Throw" | "ReThrow" | "Jump" | "JumpConstant")
+        };
+        if !exits(&self.instrs[t - 1]) {
+            return None;
+        }
+        let mut k = t + 1;
+        while k < self.instrs.len() {
+            if exits(&self.instrs[k - 1]) || counts.contains_key(&self.instrs[k].offset) {
+                return Some(k);
+            }
+            k += 1;
+        }
+        Some(k)
+    }
+
+    /// Does any jump in instructions `[from, to)` land in `[lo, hi)`?
+    fn jumps_into(&self, from: usize, to: usize, lo: usize, hi: usize) -> bool {
+        let (Some(lo_off), hi_off) = (
+            self.instrs.get(lo).map(|x| x.offset),
+            self.instrs.get(hi).map(|x| x.offset).unwrap_or(usize::MAX),
+        ) else {
+            return false;
+        };
+        self.instrs[from..to.min(self.instrs.len())].iter().any(|ins| {
+            self.cond_jump_target(ins)
+                .or_else(|| self.uncond_jump_target(ins))
+                .is_some_and(|t| t >= lo_off && t < hi_off)
+        })
+    }
+
     fn uncond_jump_target(&self, ins: &Instr) -> Option<usize> {
         let base = ins.name.split('.').next().unwrap_or(&ins.name);
         if !matches!(base, "Jump" | "JumpConstant" | "JumpLoop" | "JumpLoopConstant") {
@@ -7405,6 +7522,71 @@ impl<'a, 'b> FnCtx<'a, 'b> {
     }
 
     /// 条件表达式（由跳转类型 + acc 推出）。返回 Expr 以便复用取反化简。
+    /// `break` to `self.loops[idx]`: a labeled block always needs its label, a loop
+    /// only when an inner loop sits between.
+    fn break_stmt(&self, idx: usize, label: &str) -> String {
+        if !self.loops[idx].is_block && (idx + 1 == self.loops.len() || label.is_empty()) {
+            "break;".to_string()
+        } else {
+            format!("break {label};")
+        }
+    }
+
+    /// `if (!a || !b) return x; rest` compiles to
+    /// `a; JumpIfFalse T; b; JumpIfTrue U; T: return x; U: rest`, and
+    /// `if (a || b) body` to `a; JumpIfTrue T; b; JumpIfFalse U; T: body; U:`. The second
+    /// jump leaves the first one's then-range, so the plain if-structuring lost it (both
+    /// paths ran the block at T). Emit `L: { if (…a) { b; if (…b) break L; } <T..U> } U…`.
+    fn try_or_guard(&mut self, i: usize, end: usize) -> Option<usize> {
+        if self.or_guard_done.contains(&i) {
+            return None;
+        }
+        let target = self.cond_jump_target(&self.instrs[i])?;
+        let &t_idx = self.idx_of.get(&target)?;
+        if t_idx <= i + 1 || t_idx > end {
+            return None;
+        }
+        let u = self.cond_jump_target(&self.instrs[t_idx - 1])?;
+        let &u_idx = self.idx_of.get(&u)?;
+        if u_idx <= t_idx || u_idx > end {
+            return None;
+        }
+        // a block that falls into U may hand it a value in the accumulator
+        // (`[a, b = 9] = …`: `LdaSmi 9` then `Star r1` at U); the labeled block has no phi
+        if !self.block_terminates(u_idx - 1) {
+            let next = self.instrs[u_idx].name.split('.').next().unwrap_or("").to_string();
+            if self.reads_acc(&next) || self.preserves_acc(&next) {
+                return None;
+            }
+        }
+        // the cold block must only be entered from these two jumps or by falling in
+        if self.loops.iter().any(|l| l.break_target == u || l.continue_target == u) {
+            return None;
+        }
+        if std::env::var("JSCD_DBG_IF").is_ok() {
+            eprintln!("[if] ③-1 or-guard i={i} target={target} t_idx={t_idx} u={u} u_idx={u_idx}");
+        }
+        self.or_guard_done.insert(i);
+        self.label_counter += 1;
+        let label = format!("L{}", self.label_counter);
+        self.line(&format!("{label}: {{"));
+        self.indent += 1;
+        self.loops.push(LoopCtx {
+            continue_target: usize::MAX,
+            break_target: u,
+            label,
+            is_block: true,
+        });
+        let r = self.emit_range(i, u_idx);
+        // an effect left in the accumulator belongs inside the block (`r0.push(x)`)
+        self.materialize_acc_stmt();
+        self.loops.pop();
+        self.indent -= 1;
+        self.line("}");
+        r.ok()?;
+        Some(u_idx)
+    }
+
     fn cond_of(&self, base: &str) -> Expr {
         // `JumpIf*Constant` (offset in the constant pool) tests the same thing; falling into
         // `_ => acc` emitted every long `JumpIfFalse*` inverted (`while (!![])` → `if ([]) break;`)
