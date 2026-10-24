@@ -1006,7 +1006,9 @@ struct FnCtx<'a, 'b> {
     /// 最近一次 context 槽读取的槽号（供紧随其后的 TDZ 检查反推变量名）
     last_ctx_slot: Option<usize>,
     /// 槽号 → 变量名（由 TDZ 检查常量池反推，弥补外层 ScopeInfo 缺失）
-    slot_aliases: HashMap<usize, String>,
+    /// TDZ-derived slot names, keyed by (slot, context level): 0 = the current context,
+    /// d = d hops out from it, `usize::MAX` = a context held in a register (unknown level).
+    slot_aliases: HashMap<(usize, usize), String>,
     /// 生成器序言把参数搬进 context（`Ldar aK; StaCurrentContextSlot [S]`）——
     /// 序言被折叠掉之后，函数体里对槽 S 的读写要还原成参数名 `aK`
     /// （否则输出 `n` 这种源码名，而形参叫 a0 → 引用不到，count(2) 一次都不迭代）。
@@ -1939,7 +1941,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         // 预扫：V8 的 TDZ 检查（`X; ThrowReferenceErrorIfHole [池索引]`）紧跟在 context 槽
         // 读取之后 → 用它把槽号绑到变量名。模块/外层 ScopeInfo 不在链上时，这是拿到真名的
         // 唯一线索（否则满屏 `__ctx.ctx25`）。
-        let mut slot_aliases: HashMap<usize, String> = HashMap::new();
+        let mut slot_aliases: HashMap<(usize, usize), String> = HashMap::new();
+        let ctx_reg = d.table.frame.map(|f| f.context_index);
         for (k, ins) in instrs.iter().enumerate() {
             let b = ins.name.split('.').next().unwrap_or(&ins.name);
             let is_ctx_load = matches!(
@@ -1960,6 +1963,22 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 Some(Operand::Imm(v)) => *v as usize,
                 _ => continue,
             };
+            // which context the slot is in: a TDZ name for slot 9 of an outer context must
+            // not name slot 9 of the current one (an async closure's own wrappers were
+            // read as the module's imports)
+            let level = if b.contains("Current") {
+                0
+            } else {
+                let depth = match ins.operands.last() {
+                    Some(Operand::Idx(v)) => *v as usize,
+                    Some(Operand::Imm(v)) => *v as usize,
+                    _ => usize::MAX,
+                };
+                match ins.operands.first() {
+                    Some(Operand::Reg(r)) if Some(*r) == ctx_reg => depth,
+                    _ => usize::MAX,
+                }
+            };
             for nxt in instrs.iter().skip(k + 1).take(2) {
                 let nb = nxt.name.split('.').next().unwrap_or(&nxt.name);
                 if nb != "ThrowReferenceErrorIfHole" {
@@ -1977,7 +1996,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 if let Some(n) = name {
                     let v = sanitize_var(&n.replace(['<', '>'], "").replace('/', "_"));
                     if !v.is_empty() {
-                        slot_aliases.entry(slot).or_insert(v);
+                        slot_aliases.entry((slot, level)).or_insert(v);
                     }
                 }
                 break;
@@ -3793,7 +3812,17 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             }
         }
         // 由 TDZ 检查反推出的别名最可靠（外层/模块 ScopeInfo 常常不在链上）
-        if let Some(n) = self.slot_aliases.get(&slot) {
+        let alias = if via_current {
+            self.slot_aliases.get(&(slot, 0))
+        } else {
+            // explicit loads fall back here only when the precise walk failed: any level
+            self.slot_aliases
+                .iter()
+                .filter(|((s, _), _)| *s == slot)
+                .min_by_key(|((_, l), _)| if *l == 0 { usize::MAX - 1 } else { *l })
+                .map(|(_, n)| n)
+        };
+        if let Some(n) = alias {
             if std::env::var("JSCD_DBG_SLOT").is_ok() {
                 eprintln!("[slot] {slot} via_current={via_current} alias -> {n}");
             }
@@ -6329,7 +6358,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         // 槽 → 绑到同一个名字，否则参数叫 e、引用却是 `__ctx.ctx4`（≤7.x 的
         // MIN_CONTEXT_SLOTS 是 4，不能写死 2），运行时就变成 undefined.message。
         self.slot_aliases
-            .insert(self.d.table.min_context_slots, catch_var.clone());
+            .insert((self.d.table.min_context_slots, 0), catch_var.clone());
         self.line(&format!("}} catch ({catch_var}) {{"));
         self.indent += 1;
         if let Err(e) = self.emit_range(catch_start, catch_setup + 1) {
