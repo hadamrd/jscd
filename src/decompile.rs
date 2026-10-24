@@ -972,6 +972,8 @@ struct LoopCtx {
     break_target: usize,
     /// 循环标签（内层 `break outer` 需要 `break L1;`）。没嵌套循环是为空串。
     label: String,
+    /// a labeled block `L: { … }`, not a loop: only `break L;` reaches it
+    is_block: bool,
 }
 
 struct FnCtx<'a, 'b> {
@@ -1070,6 +1072,8 @@ struct FnCtx<'a, 'b> {
     /// 刚创建的上下文（等待 Star/Mov 落进寄存器后登记到 reg_scope）
     pending_ctx: Option<ObjId>,
     label_counter: usize,
+    /// cond jumps already wrapped in a labeled block (see `try_or_guard`)
+    or_guard_done: HashSet<usize>,
     tmp_counter: usize,
     /// 分支间物化的累加器变量（phi）
     phi_vars: Vec<String>,
@@ -2107,6 +2111,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             reg_scope: HashMap::new(),
             pending_ctx: None,
             label_counter: 0,
+            or_guard_done: HashSet::new(),
             tmp_counter: 0,
             phi_vars: Vec::new(),
             skip_to: None,
@@ -6834,6 +6839,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     continue_target: ins.offset,
                     break_target: exit_target,
                     label: label.clone(),
+                    is_block: false,
                 });
                 // 循环头指令要放在循环体内：`continue` 回到顶部时需要重新求值（条件计算就在头部）
                 self.emit_expr_statement(&ins);
@@ -6865,6 +6871,12 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 continue;
             }
 
+            // ③-1 `if (!a || !b) return x;`: see try_or_guard
+            if let Some(next) = self.try_or_guard(i, end) {
+                i = next.max(i + 1);
+                continue;
+            }
+
             // ③ 条件跳转
             if let Some(target) = self.cond_jump_target(&ins) {
                 self.flush_acc_before(&base);
@@ -6889,11 +6901,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     .rposition(|l| l.break_target == target)
                     .map(|idx| (idx, self.loops[idx].label.clone()));
                 if let Some((idx, label)) = brk {
-                    let stmt = if idx + 1 == self.loops.len() || label.is_empty() {
-                        "break;".to_string()
-                    } else {
-                        format!("break {label};")
-                    };
+                    let stmt = self.break_stmt(idx, &label);
                     self.line(&format!("if ({cond}) {stmt}"));
                     i += 1;
                     continue;
@@ -7173,11 +7181,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                         .map(|idx| (idx, self.loops[idx].label.clone()))
                     {
                         self.flush_acc_at_edge(target);
-                        if idx + 1 == self.loops.len() || label.is_empty() {
-                            self.line("break;");
-                        } else {
-                            self.line(&format!("break {label};"));
-                        }
+                        let stmt = self.break_stmt(idx, &label);
+                        self.line(&stmt);
                     } else {
                         self.line(&format!("/* 回边 @{target}（未识别的循环结构） */"));
                     }
@@ -7191,11 +7196,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     .map(|idx| (idx, self.loops[idx].label.clone()))
                 {
                     self.flush_acc_before(&base);
-                    if idx + 1 == self.loops.len() || label.is_empty() {
-                        self.line("break;");
-                    } else {
-                        self.line(&format!("break {label};"));
-                    }
+                    let stmt = self.break_stmt(idx, &label);
+                    self.line(&stmt);
                 }
                 // A forward jump out of this range (a switch case's `break` to the join,
                 // with the next case's body laid out right after it): what follows is
@@ -7496,6 +7498,71 @@ impl<'a, 'b> FnCtx<'a, 'b> {
     }
 
     /// 条件表达式（由跳转类型 + acc 推出）。返回 Expr 以便复用取反化简。
+    /// `break` to `self.loops[idx]`: a labeled block always needs its label, a loop
+    /// only when an inner loop sits between.
+    fn break_stmt(&self, idx: usize, label: &str) -> String {
+        if !self.loops[idx].is_block && (idx + 1 == self.loops.len() || label.is_empty()) {
+            "break;".to_string()
+        } else {
+            format!("break {label};")
+        }
+    }
+
+    /// `if (!a || !b) return x; rest` compiles to
+    /// `a; JumpIfFalse T; b; JumpIfTrue U; T: return x; U: rest`, and
+    /// `if (a || b) body` to `a; JumpIfTrue T; b; JumpIfFalse U; T: body; U:`. The second
+    /// jump leaves the first one's then-range, so the plain if-structuring lost it (both
+    /// paths ran the block at T). Emit `L: { if (…a) { b; if (…b) break L; } <T..U> } U…`.
+    fn try_or_guard(&mut self, i: usize, end: usize) -> Option<usize> {
+        if self.or_guard_done.contains(&i) {
+            return None;
+        }
+        let target = self.cond_jump_target(&self.instrs[i])?;
+        let &t_idx = self.idx_of.get(&target)?;
+        if t_idx <= i + 1 || t_idx > end {
+            return None;
+        }
+        let u = self.cond_jump_target(&self.instrs[t_idx - 1])?;
+        let &u_idx = self.idx_of.get(&u)?;
+        if u_idx <= t_idx || u_idx > end {
+            return None;
+        }
+        // a block that falls into U may hand it a value in the accumulator
+        // (`[a, b = 9] = …`: `LdaSmi 9` then `Star r1` at U); the labeled block has no phi
+        if !self.block_terminates(u_idx - 1) {
+            let next = self.instrs[u_idx].name.split('.').next().unwrap_or("").to_string();
+            if self.reads_acc(&next) || self.preserves_acc(&next) {
+                return None;
+            }
+        }
+        // the cold block must only be entered from these two jumps or by falling in
+        if self.loops.iter().any(|l| l.break_target == u || l.continue_target == u) {
+            return None;
+        }
+        if std::env::var("JSCD_DBG_IF").is_ok() {
+            eprintln!("[if] ③-1 or-guard i={i} target={target} t_idx={t_idx} u={u} u_idx={u_idx}");
+        }
+        self.or_guard_done.insert(i);
+        self.label_counter += 1;
+        let label = format!("L{}", self.label_counter);
+        self.line(&format!("{label}: {{"));
+        self.indent += 1;
+        self.loops.push(LoopCtx {
+            continue_target: usize::MAX,
+            break_target: u,
+            label,
+            is_block: true,
+        });
+        let r = self.emit_range(i, u_idx);
+        // an effect left in the accumulator belongs inside the block (`r0.push(x)`)
+        self.materialize_acc_stmt();
+        self.loops.pop();
+        self.indent -= 1;
+        self.line("}");
+        r.ok()?;
+        Some(u_idx)
+    }
+
     fn cond_of(&self, base: &str) -> Expr {
         // `JumpIf*Constant` (offset in the constant pool) tests the same thing; falling into
         // `_ => acc` emitted every long `JumpIfFalse*` inverted (`while (!![])` → `if ([]) break;`)
