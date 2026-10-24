@@ -7580,6 +7580,10 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                         self.context_name_base(slot, false, base)
                     );
                 }
+                // no precise name: a TDZ name taken from a load of the same shape (same
+                // context register kind and depth) before any other level's
+                let level = if ctx_is_current { depth } else { usize::MAX };
+                let precise = precise.or_else(|| self.slot_aliases.get(&(slot, level)).cloned());
                 self.acc = Some(Expr::Ident(
                     precise.unwrap_or_else(|| self.context_name_base(slot, false, base)),
                 ));
