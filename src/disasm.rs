@@ -1100,7 +1100,9 @@ pub fn decode_string(cache: &CodeCache<'_>, table: &VersionTable, id: ObjId) -> 
     let chars_off = rt(table.string_chars_offset.unwrap_or(16));
     let d = cache.raw_at(id, chars_off, length)?;
     if is_one_byte {
-        Some(String::from_utf8_lossy(d).into_owned())
+        // V8 one-byte strings are Latin-1, not UTF-8: "contrôle" is stored as `F4`, which
+        // UTF-8 decoding turned into U+FFFD
+        Some(d.iter().map(|&b| b as char).collect())
     } else {
         let u16s: Vec<u16> = d
             .chunks(2)
