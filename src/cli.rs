@@ -234,8 +234,8 @@ fn functions_cmd(file: &Path, common: &Common, json_flag: bool) -> Result<(), St
     let mut json_items = Vec::new();
     let mut visited = std::collections::HashSet::new();
     // 迭代式遍历（避免嵌套 fn 捕获环境），栈序保证父先于子
-    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|r| (*r, 0)).collect();
-    while let Some((id, depth)) = stack.pop() {
+    let mut stack: Vec<(usize, usize, Option<usize>)> = roots.iter().rev().map(|r| (*r, 0, None)).collect();
+    while let Some((id, depth, parent)) = stack.pop() {
         if !visited.insert(id) {
             continue;
         }
@@ -291,12 +291,12 @@ fn functions_cmd(file: &Path, common: &Common, json_flag: bool) -> Result<(), St
             indent = depth * 2
         );
         json_items.push(serde_json::json!({
-            "id": id, "name": name, "depth": depth, "compiled": bca.is_some(),
+            "id": id, "name": name, "depth": depth, "parent": parent, "compiled": bca.is_some(),
             "params": params, "frame_size": frame, "bytecode_length": bc_len,
         }));
         if let Some(kids) = children.get(&id) {
             for c in kids.iter().rev() {
-                stack.push((*c, depth + 1));
+                stack.push((*c, depth + 1, Some(id)));
             }
         }
     }
