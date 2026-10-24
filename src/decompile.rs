@@ -6994,7 +6994,10 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                         // 有 else 时看两个分支是否给出不同值（默认参数 `b = 2` 的
                         // 形态里 else 恰好把 acc 还原成入口值，只比入口会漏 phi）；
                         // 没有 else 时只能跟入口比。
-                        let changed = if has_else { then_v != cur } else { cur != entry };
+                        let else_effect = has_else
+                            && !self.acc_stored
+                            && self.acc.as_ref().is_some_and(|e| e.has_effect());
+                        let changed = if has_else { then_v != cur || else_effect } else { cur != entry };
                         if std::env::var("JSCD_DBG_IF").is_ok() {
                             eprintln!(
                                 "[if] i={i} target={target} then={then_v:?} else={cur:?} entry={entry:?} changed={changed} has_else={has_else}"
@@ -7150,8 +7153,11 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             _ => self.acc.as_ref().map(|e| e.render()),
         };
         let b = before.as_ref().map(|e| e.render()).unwrap_or_default();
+        // a pending call is this branch's own evaluation, even when its text matches the
+        // other branch's: `if (c) send("ok", x) else send("err", y)` both leave `r0(r1, r2)`
+        let effect = !self.acc_stored && self.acc.as_ref().is_some_and(|e| e.has_effect());
         if let Some(a) = cur {
-            if a != b && !a.is_empty() {
+            if (a != b || effect) && !a.is_empty() {
                 self.line(&format!("{phi} = {a};"));
             }
         }
