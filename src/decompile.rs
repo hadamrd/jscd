@@ -1042,6 +1042,11 @@ struct FnCtx<'a, 'b> {
     async_dispatch: Option<(usize, usize)>,
     /// 已被 try/finally 规则消费的 handler 起点（旧 try/catch 规则不再重复包）
     used_handler_starts: Vec<usize>,
+    /// Blocks already emitted where their only jump is (start index → end index): the
+    /// range they sit in skips them.
+    inlined_blocks: HashMap<usize, usize>,
+    /// Jump target offset → number of jumps landing there (built on first use).
+    jump_target_count: Option<HashMap<usize, usize>>,
     /// emit_range 递归深度（护栏，防栈溢出）
     emit_depth: usize,
     /// 寄存器 → 它当前持有的属性访问表达式（`r2 = o.m` → `r2 => o.m`）。
@@ -2089,6 +2094,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             is_async_gen: false,
             async_dispatch: None,
             used_handler_starts: Vec::new(),
+            inlined_blocks: HashMap::new(),
+            jump_target_count: None,
             emit_depth: 0,
             reg_prop: HashMap::new(),
             out: String::new(),
@@ -6534,7 +6541,12 @@ impl<'a, 'b> FnCtx<'a, 'b> {
     }
 
     fn emit_range_inner(&mut self, mut i: usize, end: usize) -> Result<(), String> {
+        let start = i;
         while i < end {
+            if let Some(&bend) = self.inlined_blocks.get(&i) {
+                i = bend.max(i + 1);
+                continue;
+            }
             let ins = self.instrs[i].clone();
             let base = ins.name.split('.').next().unwrap_or(&ins.name).to_string();
 
@@ -7185,6 +7197,33 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                         self.line(&format!("break {label};"));
                     }
                 }
+                // A forward jump out of this range (a switch case's `break` to the join,
+                // with the next case's body laid out right after it): what follows is
+                // only reached by jumps from outside the range, which emit it themselves.
+                // Unless something earlier in the range jumps into it, stop here;
+                // carrying on runs every later case (`case a: x; break; case b: y` → x; y).
+                if let Some(&t_idx) = self.idx_of.get(&target) {
+                    // the block it lands on has no other way in (a switch's `default`
+                    // placed after the cases): it runs here, nowhere else
+                    if t_idx >= end {
+                        if let Some(bend) = self.owned_block(t_idx) {
+                            self.flush_acc_before(&base);
+                            self.emit_range(t_idx, bend)?;
+                            self.inlined_blocks.insert(t_idx, bend);
+                            if !self.jumps_into(start, i, i + 1, end) {
+                                i = end;
+                            } else {
+                                i += 1;
+                            }
+                            continue;
+                        }
+                    }
+                    if t_idx >= end && i + 1 < end && !self.jumps_into(start, i, i + 1, end) {
+                        self.flush_acc_before(&base);
+                        i = end;
+                        continue;
+                    }
+                }
                 // 其他前向 Jump：通常是 if 的尾部跳转，已由 ③ 消费
                 i += 1;
                 continue;
@@ -7336,6 +7375,58 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             .map(|x| x.offset)
             .unwrap_or(usize::MAX);
         Some((back, exit))
+    }
+
+    /// The block starting at instruction `t` when exactly one jump reaches it and the
+    /// instruction before it cannot fall into it: its end (exclusive), at the first
+    /// jump target or after the first unconditional exit.
+    fn owned_block(&mut self, t: usize) -> Option<usize> {
+        if t == 0 || t >= self.instrs.len() || self.inlined_blocks.contains_key(&t) {
+            return None;
+        }
+        if self.jump_target_count.is_none() {
+            let mut m: HashMap<usize, usize> = HashMap::new();
+            for ins in &self.instrs {
+                if let Some(x) = self.cond_jump_target(ins).or_else(|| self.uncond_jump_target(ins)) {
+                    *m.entry(x).or_default() += 1;
+                }
+            }
+            self.jump_target_count = Some(m);
+        }
+        let counts = self.jump_target_count.as_ref()?;
+        if counts.get(&self.instrs[t].offset).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        let exits = |ins: &Instr| {
+            let b = ins.name.split('.').next().unwrap_or(&ins.name);
+            matches!(b, "Return" | "Throw" | "ReThrow" | "Jump" | "JumpConstant")
+        };
+        if !exits(&self.instrs[t - 1]) {
+            return None;
+        }
+        let mut k = t + 1;
+        while k < self.instrs.len() {
+            if exits(&self.instrs[k - 1]) || counts.contains_key(&self.instrs[k].offset) {
+                return Some(k);
+            }
+            k += 1;
+        }
+        Some(k)
+    }
+
+    /// Does any jump in instructions `[from, to)` land in `[lo, hi)`?
+    fn jumps_into(&self, from: usize, to: usize, lo: usize, hi: usize) -> bool {
+        let (Some(lo_off), hi_off) = (
+            self.instrs.get(lo).map(|x| x.offset),
+            self.instrs.get(hi).map(|x| x.offset).unwrap_or(usize::MAX),
+        ) else {
+            return false;
+        };
+        self.instrs[from..to.min(self.instrs.len())].iter().any(|ins| {
+            self.cond_jump_target(ins)
+                .or_else(|| self.uncond_jump_target(ins))
+                .is_some_and(|t| t >= lo_off && t < hi_off)
+        })
     }
 
     fn uncond_jump_target(&self, ins: &Instr) -> Option<usize> {

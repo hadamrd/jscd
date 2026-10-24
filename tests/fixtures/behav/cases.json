@@ -573,5 +573,21 @@
         false
       ]
     ]
+  },
+  "switch_computed_cases": {
+    "cases": [
+      [
+        "a"
+      ],
+      [
+        "b"
+      ],
+      [
+        "c"
+      ],
+      [
+        "z"
+      ]
+    ]
   }
 }
