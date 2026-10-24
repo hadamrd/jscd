@@ -1229,11 +1229,35 @@ impl<'a> Decompiler<'a> {
     /// `const nest = (x) => (y) => x * y` 的内外两层箭头都叫 `nest`；同名声明会互相
     /// 覆盖、引用（DeclareGlobals、闭包常量）全都指到最后一个。这里按对象顺序去重：
     /// 先到的用本名，后来的加 `_2`/`_3` 后缀（闭包里对它的引用同步用这个名字）。
+    /// `function_syntax_kind` from the SFI flags (0 = anonymous expression, 1 = named
+    /// expression, 2 = declaration, ...). Bits 7..9 per the 8.x `SharedFunctionInfoFlags`;
+    /// only trusted on 8.7, where it was checked against known declarations.
+    fn sfi_syntax_kind(&self, sfi: ObjId) -> Option<u32> {
+        if !self.table.v8.starts_with("8.7.") {
+            return None;
+        }
+        let off = self.table.shared_function_info.as_ref()?.fields.get("flags").copied()?;
+        let rt = self.cache.bca_rt_off(self.table, self.ts, sfi, off);
+        let b = self.cache.raw_at_ts(sfi, rt, 4, self.ts)?;
+        Some((u32::from_le_bytes(b.try_into().ok()?) >> 7) & 7)
+    }
+
     pub fn function_emit_name(&self, sfi: ObjId) -> String {
         let mut slot = self.emit_names.borrow_mut();
         if slot.is_none() {
             let mut map: HashMap<ObjId, String> = HashMap::new();
             let mut used: HashSet<String> = HashSet::new();
+            // Variables any scope declares: an anonymous function emitted under the name
+            // of the variable it is stored in turned the store into `x = x`, dropped, and
+            // the obfuscator's self-replacing decoder vanished.
+            let mut bindings: HashSet<String> = HashSet::new();
+            for id in 0..self.cache.objects.len() {
+                if self.cache.obj(id).ty.is(self.table, "ScopeInfo") {
+                    if let Some(s) = read_scope(self.cache, self.table, self.ts, id, self.ro_map.as_deref()) {
+                        bindings.extend(s.context_locals.into_iter().filter(|n| !n.is_empty()));
+                    }
+                }
+            }
             for id in 0..self.cache.objects.len() {
                 if !self.cache.obj(id).ty.is(self.table, "SharedFunctionInfo") {
                     continue;
@@ -1241,6 +1265,8 @@ impl<'a> Decompiler<'a> {
                 let raw = self.dis.sfi_name(id);
                 let base = if raw.trim().is_empty() {
                     anon_name(id)
+                } else if bindings.contains(raw.trim()) && self.sfi_syntax_kind(id) == Some(0) {
+                    format!("{}_fn", sanitize_var(&raw))
                 } else {
                     sanitize_var(&raw)
                 };
@@ -1506,7 +1532,7 @@ var __uncompiled = new Proxy({}, { get: () => function () {} });
         // 而这些名字是函数声明（有 hoisting），赋值本身没有。
         let mut alias = String::new();
         for id in 0..self.cache.objects.len() {
-            if !self.cache.obj(id).ty.is(self.table, "SharedFunctionInfo") {
+                        if !self.cache.obj(id).ty.is(self.table, "SharedFunctionInfo") {
                 continue;
             }
             let raw = self.dis.sfi_name(id);
@@ -1537,7 +1563,10 @@ var __uncompiled = new Proxy({}, { get: () => function () {} });
                     continue;
                 }
             }
-            let text = self.decompile_function(id)?;
+            let text = match self.decompile_function(id) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("jscd: skip fn id={}: {}", id, e); continue; }
+            };
             w.write_str(&text).map_err(|_| "write failed".to_string())?;
         }
         Ok(())
@@ -1627,7 +1656,7 @@ var __uncompiled = new Proxy({}, { get: () => function () {} });
                 scope.as_ref().map(|s| s.flags).unwrap_or(0),
             );
         }
-        let mut ctx = FnCtx::new(self, sfi, bca, scope, scope_id)?;
+        let mut ctx = Box::new(FnCtx::new(self, sfi, bca, scope, scope_id)?);
         if ctx.wrapper_factory {
             // 闭包工厂只是"把包装函数交出去"，没有可执行的顶层语句
             return Ok(String::new());
@@ -1819,6 +1848,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             .raw_at_ts(bca, len_off, ts, ts)
             .and_then(crate::serializer::decode_smi_bytes)
             .unwrap_or(0) as usize;
+
+
         let hdr = d.cache.bca_rt_off(d.table, ts, bca, ba.header_size);
         let code = d.cache.raw_at_ts(bca, hdr, bytecode_len, ts).unwrap_or(&[]);
         let parameter_size = ba
@@ -2616,11 +2647,18 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         None
     }
 
+    /// Upper bound on the elements a literal-backing array can hold: its byte size in tagged
+    /// slots. Guards against garbage lengths without truncating real literals (a flat 64 cut
+    /// an obfuscator's 8669-entry string table to 64 entries).
+    fn elem_cap(&self, o: ObjId) -> usize {
+        self.d.cache.obj(o).byte_size / self.d.ts.max(1)
+    }
+
     /// FixedArray 常量值序列 → `[ … ]`（非全常量位在 6.x 里是 the_hole）。
     fn fixed_array_literal(&mut self, holder: ObjId) -> Expr {
         let n = self.d.cache.array_len(holder);
         let mut items = Vec::new();
-        for i in 0..n.min(64) {
+        for i in 0..n.min(self.elem_cap(holder)) {
             items.push(self.fixed_elem_expr(holder, i));
         }
         Expr::ArrayLit(items)
@@ -2666,7 +2704,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             }
         }
         let mut parts = Vec::new();
-        for i in 0..count.min(64) {
+        for i in 0..count.min(self.elem_cap(o)) {
             let key = self.elem_key(o, start + 2 * i);
             let val = self.fixed_elem_expr(o, start + 2 * i + 1);
             let k = match key {
@@ -2954,7 +2992,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
     /// 对象字面量的"键为字符串"打分（用于自动判定 kDescriptionStartIndex）。
     fn obp_string_keys(&self, o: ObjId, start: usize, len: usize) -> usize {
         let count = if start >= 2 { len / 2 } else { len.saturating_sub(start) / 2 };
-        (0..count.min(64))
+        (0..count.min(self.elem_cap(o)))
             .filter(|i| self.elem_key(o, start + 2 * i).is_some_and(|k| !k.starts_with('<') || k.starts_with("<ro")))
             .count()
     }
@@ -3007,7 +3045,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             len.saturating_sub(start) / 2
         };
         let mut parts = Vec::new();
-        for i in 0..count.min(64) {
+        for i in 0..count.min(self.elem_cap(o)) {
             let key = self.elem_key(o, start + 2 * i);
             let val = match self.d.cache.array_elem(o, start + 2 * i + 1) {
                 Some(Elem::Smi(v)) => Expr::Num(v as f64),
@@ -3079,7 +3117,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             );
         }
         let mut items = Vec::new();
-        for i in 0..len.min(64) {
+        for i in 0..len.min(self.elem_cap(holder)) {
             // 双精度数组的元素是原始 f64 —— 必须走 8 字节解码；否则 Smi 判定
             // （低 32 位为 0）会与低半为零的 double（1.5、-0、0.5…）撞车，
             // 把高半截成整数（`[1.5]` → `[1073217536]`）。
@@ -3827,6 +3865,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             return r;
         }
         let base = name.split('.').next().unwrap_or(name);
+        let base = base.strip_suffix("Constant").unwrap_or(base);
         matches!(
             base,
             "Star" | "Star0" | "Star1" | "Star2" | "Star3" | "Star4" | "Star5" | "Star6" | "Star7"
@@ -5849,7 +5888,14 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         }
         // ── 发射 ──
         self.flush_acc_before("SwitchOnSmiNoFeedback");
-        self.line(&format!("switch ({var_name}) {{"));
+        // `<this>`/`<context>` are register spellings, not JS
+        let subject = if var_name.starts_with('<') {
+            let e = self.operand_expr(&var_name);
+            Self::render_stmt(&e)
+        } else {
+            var_name.clone()
+        };
+        self.line(&format!("switch ({subject}) {{"));
         self.indent += 1;
         // 按目标体归组：同一个体的所有 case 标签要挤在体之前
         // （V8 的派发链顺序是 1→体A、2→体A、3→体B，直接顺序输出会把 case 2 挂到体 B 上）
@@ -6981,6 +7027,17 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                                         let else_start = self.out.len();
                                         else_text_start = else_start;
                                         // 不按 `end` 裁剪：短路共享目标可能正好在当前范围之外
+                                        // —— except when a catch handler starts in [end, e_idx):
+                                        // then we are in a try body and the join is past the
+                                        // handler (`try { if (c) break; else X } catch {..}` in a
+                                        // loop), so running on would emit the catch code twice
+                                        let crosses_handler = e_idx > end
+                                            && self.handlers.iter().any(|h| {
+                                                self.idx_of
+                                                    .get(&(h.target as usize))
+                                                    .is_some_and(|&t| t >= end && t < e_idx)
+                                            });
+                                        let e_idx = if crosses_handler { end } else { e_idx };
                                         self.emit_range(t_idx, e_idx)?;
                                         self.materialize_acc(&phi, &acc_then);
                                         else_assigned = self.out[else_start..].contains(&format!("{phi} = "));
@@ -7248,7 +7305,7 @@ impl<'a, 'b> FnCtx<'a, 'b> {
             else {
                 continue;
             };
-            if t == head && (ins.name.starts_with("JumpLoop") || t <= ins.offset) {
+            if t == head && (ins.name.starts_with("JumpLoop") || t < ins.offset) {
                 back = Some(j);
             }
         }
@@ -7330,6 +7387,9 @@ impl<'a, 'b> FnCtx<'a, 'b> {
 
     /// 条件表达式（由跳转类型 + acc 推出）。返回 Expr 以便复用取反化简。
     fn cond_of(&self, base: &str) -> Expr {
+        // `JumpIf*Constant` (offset in the constant pool) tests the same thing; falling into
+        // `_ => acc` emitted every long `JumpIfFalse*` inverted (`while (!![])` → `if ([]) break;`)
+        let base = base.strip_suffix("Constant").unwrap_or(base);
         let acc = self.acc.clone().unwrap_or(Expr::Bool(true));
         let neg = |e: Expr| Expr::Un {
             op: "!",
@@ -8110,7 +8170,8 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                         "CallUndefinedReceiver1" => 1,
                         _ => 2,
                     };
-                    (0..n).map(|k| self.operand_expr(&arg(1 + k))).collect()
+                    let args: Vec<Expr> = (0..n).map(|k| self.operand_expr(&arg(1 + k))).collect();
+                    args
                 };
                 self.acc = Some(Expr::Call {
                     callee: Box::new(callee),
@@ -8499,18 +8560,18 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                     let cooked_arr = self.template_part(o, 2);
                     if let (Some(r), Some(c)) = (raw_arr, cooked_arr) {
                         let n = self.d.cache.array_len(c);
-                        for k in 0..n.min(64) {
+                        for k in 0..n.min(self.elem_cap(c)) {
                             cooked.push(self.array_element_expr(c, k));
                         }
                         let n2 = self.d.cache.array_len(r);
-                        for k in 0..n2.min(64) {
+                        for k in 0..n2.min(self.elem_cap(r)) {
                             raw.push(self.array_element_expr(r, k));
                         }
                     } else {
                         // 退路：老版本/未知布局按一半一半读
                         let len = self.d.cache.array_len(o);
                         let half = len / 2;
-                        for k in 0..half.min(64) {
+                        for k in 0..half.min(self.elem_cap(o)) {
                             cooked.push(self.array_element_expr(o, k));
                             raw.push(self.array_element_expr(o, half + k));
                         }
