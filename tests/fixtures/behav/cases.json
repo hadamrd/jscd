@@ -725,5 +725,12 @@
       ]
     ],
     "known_fail": "per-iteration let copy-back emitted after PopContext (emission-order context tracking)"
+  },
+  "latin1_strings": {
+    "cases": [
+      [
+        1
+      ]
+    ]
   }
 }
