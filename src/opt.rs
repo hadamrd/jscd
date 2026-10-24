@@ -972,16 +972,35 @@ fn effects_and_reads(text: &str, open_calls: bool) -> (bool, bool) {
         }
     }
     let s: String = t.iter().collect();
-    for op in ["++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "**=", "??=", "||=", "&&="] {
-        if s.contains(op) {
-            effect = true;
-        }
+    if s.contains("++") || s.contains("--") {
+        effect = true;
     }
     for (i, &c) in t.iter().enumerate() {
         if c == '=' {
             let p = if i > 0 { t[i - 1] } else { ' ' };
             let n = t.get(i + 1).copied().unwrap_or(' ');
-            if !matches!(p, '=' | '!' | '<' | '>') && !matches!(n, '=' | '>') && !stores_local(&t[..i]) {
+            if matches!(n, '=' | '>') || matches!(p, '=' | '!') || (matches!(p, '<' | '>') && !s[..i].ends_with("<<") && !s[..i].ends_with(">>")) {
+                continue; // comparison or arrow
+            }
+            if open_calls {
+                // a prefix: the store happens after what we insert, a plain
+                // target is not even read (`x = <here>`)
+                if p == ' ' || is_ident_byte(p as u8) {
+                    let mut j = i;
+                    while j > 0 && t[j - 1] == ' ' {
+                        j -= 1;
+                    }
+                    let mut k = j;
+                    while k > 0 && is_ident_byte(t[k - 1] as u8) {
+                        k -= 1;
+                    }
+                    if k < j && (k == 0 || t[k - 1] != '.') {
+                        for e in &mut exempt[k..j] {
+                            *e = true;
+                        }
+                    }
+                }
+            } else {
                 effect = true;
             }
         }
@@ -1014,16 +1033,6 @@ fn effects_and_reads(text: &str, open_calls: bool) -> (bool, bool) {
         i += 1;
     }
     (effect, read)
-}
-
-/// Is the `=` after `lhs` a store into a local (`r3 = `, `let phi2 = `)?
-fn stores_local(lhs: &[char]) -> bool {
-    let l: String = lhs.iter().collect();
-    let l = l.trim_end();
-    let start = l.rfind(|c: char| !is_ident_byte(c as u8)).map_or(0, |p| p + 1);
-    let word = &l[start..];
-    let before = l[..start].trim_end();
-    !word.is_empty() && local_or_constant(word) && !before.ends_with('.') && !before.ends_with(']')
 }
 
 /// Names whose value no call can change: registers, parameters, phis, temps,
