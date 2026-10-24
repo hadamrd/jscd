@@ -8014,7 +8014,17 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 //   PushContext 留在 rX 里的外层上下文 —— 拿最内层解会读成 `rab`）。
                 let r = reg_of(&arg(0));
                 let len = self.ctx_scopes.len();
-                let prev = if len >= 2 { self.ctx_scopes[len - 2] } else { None };
+                // ctx_scopes holds block/catch contexts only, not the function's own
+                // (`CreateFunctionContext; PushContext r9`). Pushing that one saves the
+                // closure's context: the function scope's outer. Pushing the first block
+                // context saves the function's (the walk skips a scope without context).
+                // Without this, `rX` reads were named from the new scope (sendReports
+                // called a string wrapper instead of `isValidDate`)
+                let prev = match len {
+                    0 => self.scope_id.and_then(|sid| self.d.scope_by_id(sid)).and_then(|sc| sc.outer),
+                    1 => self.scope_id,
+                    _ => self.ctx_scopes[len - 2],
+                };
                 if std::env::var("JSCD_DBG_CTX").is_ok() {
                     eprintln!("[pushctx] r{r} len={len} ctx_scopes={:?} prev={prev:?}", self.ctx_scopes);
                 }
