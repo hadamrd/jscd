@@ -3642,6 +3642,23 @@ impl<'a, 'b> FnCtx<'a, 'b> {
         }
     }
 
+    /// The scope `depth` context hops out from `start` (same counting as
+    /// `context_name_walk`).
+    fn context_walk_sid(&self, start: ObjId, depth: usize) -> Option<ObjId> {
+        let mut sid = start;
+        let mut hops = depth;
+        loop {
+            let scope = self.d.scope_by_id(sid)?;
+            if !scope.context_locals.is_empty() || scope.locals_table.is_some() {
+                if hops == 0 {
+                    return Some(sid);
+                }
+                hops -= 1;
+            }
+            sid = scope.outer?;
+        }
+    }
+
     /// 显式上下文读取（`LdaContextSlot rN, [slot], [depth]`）的名字：从 rN 持有的
     /// 上下文作用域出发。
     fn context_name_via_reg(&self, reg: u32, slot: usize, depth: usize, base: usize) -> Option<String> {
@@ -7721,7 +7738,25 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 } else {
                     self.d.table.min_context_slots
                 };
-                let nm = self.context_name_base(slot, true, base);
+                // the current scope is known (no context pushed, or a block/catch scope we
+                // have): name the slot from it. Going straight to the aliases named a
+                // per-iteration `let i` after the param copied into slot 2 (`i = ++a0`)
+                let catch_slot = slot == self.d.table.min_context_slots && self.catch_alias.is_some();
+                let known = self.ctx_scopes.last().map(|x| x.is_some()).unwrap_or(true);
+                let precise = if catch_slot || !known {
+                    None
+                } else {
+                    self.context_name_by_depth(slot, 0, base).map(|n| {
+                        let landed = self.ctx_scopes.last().copied().flatten().or(self.scope_id)
+                            .and_then(|st| self.context_walk_sid(st, 0));
+                        let own = self.scope_id.and_then(|st| self.context_walk_sid(st, 0));
+                        match self.gen_param_slots.get(&slot) {
+                            Some(p) if landed.is_some() && landed == own => p.clone(),
+                            _ => n,
+                        }
+                    })
+                };
+                let nm = precise.unwrap_or_else(|| self.context_name_base(slot, true, base));
                 if std::env::var("JSCD_DBG_SLOT").is_ok() {
                     eprintln!("[lda] slot={slot} -> {nm}");
                 }
@@ -7750,16 +7785,26 @@ impl<'a, 'b> FnCtx<'a, 'b> {
                 } else {
                     self.context_reg_slot_depth(&ops)
                         .and_then(|(r, _, d)| self.context_name_via_reg(r, slot, d, base))
-                }
+                };
                 // 形参拷贝槽优先用 `aK`：async/生成器的序言把形参搬进上下文槽，
                 // 摊平产物里形参是 `aK` 而**不是**源码名（这里算出 `q` 会让
                 // `await q` 变成未声明名字 → undefined；node8/10 的 async retry 就栽在这）。
-                .filter(|n| {
-                    self.gen_param_slots
-                        .get(&slot)
-                        .map(|p| p == n)
-                        .unwrap_or(true)
-                });
+                // Only for the function's own context: a read through a register that
+                // lands there (`PushContext r21` after a block context) is the param too,
+                // and dropping its name let a fallback pick another slot-4 name (`app`).
+                let landed = if ctx_is_current {
+                    self.ctx_scopes.last().copied().flatten().or(self.scope_id)
+                        .and_then(|st| self.context_walk_sid(st, depth))
+                } else {
+                    self.context_reg_slot_depth(&ops)
+                        .and_then(|(r, _, d)| self.reg_scope.get(&r).and_then(|&st| self.context_walk_sid(st, d)))
+                };
+                let own = self.scope_id.and_then(|st| self.context_walk_sid(st, 0));
+                let param = self.gen_param_slots.get(&slot).cloned();
+                let precise = match (&precise, &param) {
+                    (Some(_), Some(p)) if landed.is_some() && landed == own => Some(p.clone()),
+                    _ => precise.filter(|n| param.as_ref().map(|p| p == n).unwrap_or(true)),
+                };
                 if std::env::var("JSCD_DBG_SLOT").is_ok() {
                     eprintln!(
                         "[lda-explicit] base={base} ops={ops:?} depth={depth} precise={precise:?} fallback={:?}",
